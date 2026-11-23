@@ -399,12 +399,16 @@ dependencies = [
  "catplay_iap2_usb",
  "catplay_iap2_usb_host",
  "catplay_lingo",
+ "catplay_mfi",
  "catplay_tracing",
  "catplay_util",
  "futures",
+ "libc 0.2.189",
  "log",
+ "rand",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

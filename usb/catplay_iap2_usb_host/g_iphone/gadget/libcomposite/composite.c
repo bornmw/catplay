@@ -23,6 +23,13 @@
 
 #include "u_os_desc.h"
 
+/* Kernels that enable USB_GADGET without USB_GADGET_VBUS_DRAW (e.g. the
+ * qemuarm build kernel) leave this undefined; the in-tree composite.c gets
+ * it from the kernel config, our out-of-tree copy needs a fallback. */
+#ifndef CONFIG_USB_GADGET_VBUS_DRAW
+#define CONFIG_USB_GADGET_VBUS_DRAW 0
+#endif
+
 /**
  * struct usb_os_string - represents OS String to be reported by a gadget
  * @bLength: total length of the entire descritor, always 0x12

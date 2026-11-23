@@ -1,8 +1,10 @@
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use catplay_csm::{
-    decoder::{AsCsmPacket, CsmFlag, CsmPacketBox, CsmPacketId, CsmPacketUtil},
+    decoder::{AsCsmPacket, CsmByteArray, CsmFlag, CsmPacketBox, CsmPacketId, CsmPacketUtil},
     files::FileTransferSetupMetaType,
     msg::*,
 };
@@ -12,16 +14,44 @@ use catplay_lingo::{
     lingos::{LingoMessage, lingo_0x3 as display, lingo_0x4 as extended, lingo_0xa as audio},
     wire::{Outgoing, TransactionIntent},
 };
-use log::{debug, warn};
+use catplay_mfi::MfiDeficeRef;
+use catplay_util::spawn_blocking;
+use log::{debug, info, warn};
+
+/// Wired CarPlay session start, as advertised by the accessory in a
+/// `CarPlayStartSession` (0x4301) with wired attributes. Carried from the
+/// iAP2/CSM session up to the transmitter client, which initiates a direct
+/// AirPlay connection to the accessory's endpoint (no `_carplay-ctrl`
+/// invitation required).
+#[derive(Clone, Debug)]
+pub struct WiredStart {
+    /// Accessory's link-local IPv6 address (no zone index, per iAP2 spec).
+    pub ip: IpAddr,
+    /// Accessory's AirPlay/RTSP TCP port.
+    pub port: u16,
+    /// Accessory's HomeKit identifier (the 0x4301 `public_key` field carries
+    /// the pairing UUID), used for the pairing fast-path.
+    pub homekit_id: Option<String>,
+}
 
 #[derive(Default)]
 pub struct CarPlayClientSession {
     id: IdentificationInformation,
     start: Option<Instant>,
     artwork_tx: Option<u8>,
+    mfi: Option<MfiDeficeRef>,
+    wired_start_tx: Option<Arc<Mutex<Option<WiredStart>>>>,
 }
 
 impl CarPlayClientSession {
+    pub fn new(mfi: Option<MfiDeficeRef>, wired_start_tx: Option<Arc<Mutex<Option<WiredStart>>>>) -> Self {
+        Self {
+            mfi,
+            wired_start_tx,
+            ..Default::default()
+        }
+    }
+
     pub fn send(&mut self, packet: &dyn AsCsmPacket, handle: &CsmClientHandleRef) -> CsmSessionResult<()> {
         warn!(
             "<- Outgoing packet @ {:?}: {:?}",
@@ -717,14 +747,44 @@ impl CsmSession for CarPlayClientSession {
         }
 
         if let Some(_response) = packet.cast::<AuthenticationCertificate>() {
+            // Fresh random 32-byte challenge: MIB3 presents an MFi 3.0 (P-256/SHA-256)
+            // certificate in 0xAA01 and its chip refuses to sign a 20-byte (MFi 2.x)
+            // challenge — it link-ACKs 0xAA02 but never answers with 0xAA03.
+            // The 32 bytes are the prehashed SHA-256 digest value itself; expect a
+            // 64-byte raw r||s ECDSA P-256 signature back in 0xAA03.
+            let mut challenge = [0u8; 32];
+            rand::fill(&mut challenge);
             self.send(
                 &RequestAuthenticationChallengeResponse {
-                    authentication_challenge: vec![0x42u8; 20].into(),
+                    authentication_challenge: challenge.to_vec().into(),
                 },
                 &_handle,
             )?;
 
             debug!("Received certificate!");
+        }
+
+        if let Some(racr) = packet.cast::<RequestAuthenticationChallengeResponse>() {
+            // MIB3 compatibility path: after presenting its certificate, the car also
+            // sends its own challenge (reverse-direction 0xAA02) and expects us to sign
+            // it with the MFi key and reply with AuthenticationResponse (0xAA03).
+            let Some(mfi) = self.mfi.clone() else {
+                warn!("Received authentication challenge from car but no MFi device is registered");
+                return Ok(());
+            };
+
+            let challenge = racr.authentication_challenge.data.clone();
+            debug!("Signing MIB3 authentication challenge ({challenge:?})");
+            let mfi = mfi.clone();
+
+            let response: CsmByteArray = spawn_blocking(move || mfi.generate_challenge_response(&challenge[..]))
+                .await
+                .unwrap()?
+                .into();
+            debug!("Responding to MIB3 challenge with AuthenticationResponse");
+
+            self.send(&AuthenticationResponse { authentication_response: response }, &_handle)?;
+            return Ok(());
         }
 
         if let Some(_response) = packet.cast::<AuthenticationResponse>() {
@@ -750,6 +810,30 @@ impl CsmSession for CarPlayClientSession {
                 self.send(
                     &DeviceInformationUpdate {
                         device_name: Some("iPhone SIM".into()),
+                    },
+                    &_handle,
+                )?;
+            }
+            // MIB3 advertises CarPlayAvailability (0x4300) in
+            // messages_received_from_device and CarPlayStartSession (0x4301) in
+            // messages_sent_by_accessory; public traces show the car issuing
+            // 0x4301 immediately after receiving 0x4300. Advertise wired
+            // CarPlay on the car's USB transport component (name taken from its
+            // identification). Omit wireless (MIB3 declares no BT transport
+            // component) and theme assets. Without this the car never starts
+            // the CarPlay session and tears the connection down after ~60 s.
+            if self.id.wants_tx(CarPlayStartSession::PACKET_ID) {
+                self.send(
+                    &CarPlayAvailability {
+                        wired_attributes: Some(CarPlayAvailabilityWiredAttributes {
+                            available: true,
+                            // Device-specific USB identifier, as real iPhones send it:
+                        // the emulated iPhone's own USB serial (g_iphone
+                        // DEFAULT_IPHONE_SERIAL), not the car's transport
+                        // component name. Must match the 0x4E0E value below.
+                        usb_transport_identifier: Some("00008130000E044E384B1D3ADDDDDDD000BADCAD".into()),
+                        }),
+                        ..CarPlayAvailability::default()
                     },
                     &_handle,
                 )?;
@@ -904,8 +988,33 @@ impl CsmSession for CarPlayClientSession {
         }
 
         if let Some(cpss) = CarPlayStartSession::cast(&packet) {
-            // TODO: trigger connection to CarPlay server now
-            debug!("Got modern CarPlay handshake: {cpss:?}");
+            warn!("Got modern CarPlay handshake: {cpss:?}");
+            // Path B: when the accessory selects a WIRED session it advertises its
+            // AirPlay endpoint (link-local IPv6 + port) here and expects the device
+            // to connect directly — it does NOT invite us via _carplay-ctrl. Hand the
+            // endpoint up to the transmitter client so it can initiate the connection.
+            if let Some(wired) = &cpss.wired_attributes
+                && let Some(ip_raw) = wired.ip_address.first()
+            {
+                // iAP2 string fields are fixed-width and null-padded; strip the
+                // padding (everything from the first NUL onward) before parsing.
+                let ip_clean = ip_raw.split('\0').next().unwrap_or("").trim();
+                match ip_clean.parse::<IpAddr>() {
+                    Ok(ip) => {
+                        let homekit_raw = cpss.public_key.split('\0').next().unwrap_or("").trim();
+                        let ws = WiredStart {
+                            ip,
+                            port: cpss.port as u16,
+                            homekit_id: Some(homekit_raw.to_owned()),
+                        };
+                        info!("Wired CarPlay start advertised: {ws:?}");
+                        if let Some(tx) = &self.wired_start_tx {
+                            *tx.lock().unwrap() = Some(ws);
+                        }
+                    }
+                    Err(e) => warn!("Wired 0x4301 ip_address failed to parse: {ip_clean:?} ({e})"),
+                }
+            }
         }
 
         Ok(())

@@ -4,7 +4,7 @@ use catplay_carplay::{
     carplay_tx::{AirPlayTransmitter, AirPlayTransmitterProxyRef, AirPlayTransmitterSessionError, TeardownGuard},
     clock::{MediaClockBox, NtpU64},
     events::CommandPending,
-    modes::{ChangeModesResponse, ResourceTransferPriority},
+    modes::{ChangeModes, ChangeModesResponse, ResourceTransferPriority},
     msg::{Command, CommandType, ControllerFeature, Display, HidDevice, InfoMessageResponse},
     rtsp_frame::{HttpStatus, RtspError, RtspResponse, RtspResult},
     screen::tx::ScreenTransmitProxy,
@@ -126,6 +126,26 @@ impl CarManager {
             None => true,
             Some(v) if v.is_ready() => true,
             _ => false,
+        }
+    }
+
+    /// DIAGNOSTIC (MIB3 SCREEN_LOSS investigation): report how stale the last
+    /// real video frame was when the car declared SCREEN_LOSS. One
+    /// observation is correlation; the 5 s IDR trickle (overlay manager) is
+    /// the controlled experiment that confirms or refutes a no-frame watchdog.
+    fn log_screen_loss(&self, v: &ChangeModes) {
+        if v.reason_str != "SCREEN_LOSS" {
+            return;
+        }
+        match self.overlay.car_screen_metrics() {
+            Some(m) => warn!(
+                "CAR_SCREEN_LOSS last_frame_age_ms={:?} last_keepalive_age_ms={:?} frames_sent={} keepalives_sent={} — car declared SCREEN_LOSS",
+                m.last_frame_sent.map(|t| t.elapsed().as_millis()),
+                m.last_keepalive_sent.map(|t| t.elapsed().as_millis()),
+                m.frames_sent,
+                m.keepalives_sent
+            ),
+            None => warn!("CAR_SCREEN_LOSS — car declared SCREEN_LOSS with no screen stream active"),
         }
     }
 
@@ -595,9 +615,15 @@ impl CarManager {
     }
 
     fn on_car_command_connected(&mut self, mut cmd: CommandPending) {
+        let cmd_type = cmd.command().get_type();
+
+        if let Command::ChangeModes(cm) = cmd.command() {
+            self.log_screen_loss(cm);
+            self.modes.on_peer_change_modes_start(cm);
+        }
+
         let peer = self.iphone_peer.as_mut().expect("iPhone peer missing");
         let phone = peer.iphone.clone();
-        let cmd_type = cmd.command().get_type();
 
         if let Command::HidSendReport(hid) = cmd.command_mut() {
             let car_media_clock = &mut self.car_media_clock;
@@ -619,10 +645,6 @@ impl CarManager {
 
         if let Command::SetNightMode(mode) = cmd.command() {
             self.night_mode = mode.night_mode;
-        }
-
-        if let Command::ChangeModes(cm) = cmd.command() {
-            self.modes.on_peer_change_modes_start(cm);
         }
 
         #[derive(PartialEq, Eq)]
@@ -678,6 +700,7 @@ impl CarManager {
                 // unless the request makes no sense, then we reject it.
                 // Don't treat such rejection as a hard sanity error; let the car decide what it wants to do.
                 info!("Attempting to accept car's ChangeModes as-is: {v:?}");
+                self.log_screen_loss(v);
                 let resp = self.modes.process_car_request(v);
 
                 if resp.is_error() {

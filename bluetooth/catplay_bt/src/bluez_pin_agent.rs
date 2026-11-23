@@ -4,14 +4,14 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dbus::MethodErr;
 use dbus::arg::{RefArg, Variant};
 use dbus::nonblock::Proxy;
 use dbus_crossroads::Crossroads;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use tokio::sync::oneshot;
 use tokio::time;
 
@@ -26,6 +26,8 @@ pub struct PairingRequest {
     pub remote_mac: String,
     pub remote_name: Option<String>,
     pub passkey: u32,
+    /// When the BlueZ RequestConfirmation arrived, for age diagnostics.
+    pub created: Instant,
     responder: ArcMutexOption<oneshot::Sender<bool>>,
 }
 
@@ -44,7 +46,22 @@ impl PairingRequest {
     }
 
     pub fn resolve(self, accept: bool) {
-        debug!("ResolvePending: {} {} {}", &self.hci, &self.remote_mac, accept);
+        if accept {
+            info!(
+                "BT_PAIR_ACCEPTED hci={} remote_mac={} remote_name={:?} age_ms={} — pairing request accepted",
+                self.hci,
+                self.remote_mac,
+                self.remote_name,
+                self.created.elapsed().as_millis()
+            );
+        } else {
+            warn!(
+                "BT_PAIR_REJECTED hci={} remote_mac={} age_ms={} — pairing request rejected",
+                self.hci,
+                self.remote_mac,
+                self.created.elapsed().as_millis()
+            );
+        }
 
         let mut responder = self.responder.lock().unwrap();
         let Some(responder): Option<oneshot::Sender<bool>> = responder.take() else {
@@ -124,6 +141,7 @@ impl BluezPinAgent {
 
         for attempt in 0..40 {
             if Self::device_is_paired_or_bonded(&proxy).await {
+                info!("BT_DEVICE_PAIRED device={} after_ms={} — BlueZ reports the device as paired/bonded", device, attempt * 250);
                 let set_trusted: Result<(), dbus::Error> = proxy
                     .method_call(
                         "org.freedesktop.DBus.Properties",
@@ -206,22 +224,31 @@ impl BluezPinAgent {
     }
 
     fn begin_request_confirmation(&self, device: &str, passkey: u32) -> Result<oneshot::Receiver<bool>, MethodErr> {
-        debug!("RequestConfirmation for device {}: {}", device, passkey);
-        let (tx, rx) = oneshot::channel();
-
         let remote = bluez_parse_path(device);
         let Some((hci, remote_mac)) = remote else {
-            debug!("invalid path: {}", device);
+            warn!("RequestConfirmation: invalid path: {}", device);
             return Err(MethodErr::failed("unparsable remote"));
         };
 
+        let remote_name = Self::get_remote_name(device);
+        info!(
+            "BT_PAIR_REQUEST hci={} remote_mac={} remote_name={:?} passkey={:06} — SSP numeric-comparison confirmation requested by BlueZ",
+            hci, remote_mac, remote_name, passkey
+        );
+
+        let (tx, rx) = oneshot::channel();
         let req = PairingRequest {
             hci,
             remote_mac,
-            remote_name: Self::get_remote_name(device),
+            remote_name,
             passkey,
+            created: Instant::now(),
             responder: Arc::new(Mutex::new(Some(tx))),
         };
+        info!(
+            "BT_PAIR_PENDING remote_mac={} passkey={:06} — pairing request stored, waiting for confirmation",
+            req.remote_mac, req.passkey
+        );
         self.pending.store(req);
 
         Ok(rx)
@@ -232,15 +259,20 @@ impl BluezPinAgent {
     }
 
     fn cancel(&self) {
-        debug!("Cancel received");
         let Some(req) = self.pending.get_pending() else {
+            debug!("Cancel received with no pending pairing request");
             return;
         };
+        warn!(
+            "BT_PAIR_CANCELLED remote_mac={} age_ms={} — BlueZ cancelled the pending pairing request",
+            req.remote_mac,
+            req.created.elapsed().as_millis()
+        );
         req.reject();
     }
 
     fn release(&self) {
-        debug!("Release received");
+        warn!("BT_AGENT_RELEASE — BlueZ released the pin agent");
         self.released.store(true, Ordering::Release);
         (self.release_callback.lock().unwrap())();
     }
@@ -311,14 +343,34 @@ pub(crate) fn register_pin_agent_interface(cr: &mut Crossroads, path: &'static s
                 };
 
                 async move {
+                    let started = std::time::Instant::now();
                     let result = match rx {
                         Ok(rx) => match rx.await {
                             Ok(true) => {
+                                info!(
+                                    "BT_PAIR_AGENT_REPLY device={} waited_ms={} — accepting: replying OK to BlueZ RequestConfirmation",
+                                    device_s,
+                                    started.elapsed().as_millis()
+                                );
                                 BluezPinAgent::spawn_trust_after_pairing(device_s);
                                 Ok(())
                             }
-                            Ok(false) => Err(MethodErr::failed("User rejected")),
-                            Err(_) => Err(MethodErr::failed("agent dropped")),
+                            Ok(false) => {
+                                warn!(
+                                    "BT_PAIR_AGENT_REPLY device={} waited_ms={} — rejecting: replying failure to BlueZ RequestConfirmation",
+                                    device_s,
+                                    started.elapsed().as_millis()
+                                );
+                                Err(MethodErr::failed("User rejected"))
+                            }
+                            Err(_) => {
+                                warn!(
+                                    "BT_PAIR_AGENT_REPLY device={} waited_ms={} — agent dropped while pairing was pending",
+                                    device_s,
+                                    started.elapsed().as_millis()
+                                );
+                                Err(MethodErr::failed("agent dropped"))
+                            }
                         },
                         Err(err) => Err(err),
                     };

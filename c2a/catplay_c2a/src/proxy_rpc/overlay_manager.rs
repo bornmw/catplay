@@ -6,7 +6,7 @@ use crate::{
 use catplay_carplay::{
     carplay_rx::AirPlayReceiverHandleRef,
     carplay_tx::TeardownGuard,
-    screen::tx::{ScreenTransmitError, ScreenTransmitProxy, ScreenTransmitSink},
+    screen::tx::{ScreenTransmitError, ScreenTransmitProxy, ScreenTransmitSink, ScreenTxMetrics},
     video::EncodedVideoFrame,
 };
 use catplay_util::{EventReconciler, EventSleeper, EventToken, deadline, event_select, futures_xordered::FuturesOrdered, mpsc};
@@ -31,6 +31,8 @@ pub struct OverlayManager {
     overlay_render_queue: FuturesOrdered<BoxFuture<'static, UiResult<EncodedVideoFrame>>>,
     overlay_current: Option<UiState>,
     overlay_last_keyframe: Option<EncodedVideoFrame>,
+    /// When the last overlay frame was pushed to the car screen (DIAGNOSTIC).
+    overlay_last_push: Option<Instant>,
 
     iphone_peer: Option<AirPlayReceiverHandleRef>,
 
@@ -55,6 +57,7 @@ impl OverlayManager {
             overlay_render_queue: Default::default(),
             overlay_current: None,
             overlay_last_keyframe: None,
+            overlay_last_push: None,
 
             iphone_peer: None,
 
@@ -94,6 +97,12 @@ impl OverlayManager {
 
     pub fn on_hid_interact(&mut self) -> bool {
         self.policy.on_hid_interact()
+    }
+
+    /// Snapshot of the car screen stream's last-sent-frame / keepalive
+    /// diagnostics, for the car manager to report at SCREEN_LOSS time.
+    pub fn car_screen_metrics(&self) -> Option<ScreenTxMetrics> {
+        self.lazy_screen.as_ref().map(|screen| screen.metrics_snapshot())
     }
 
     fn clear_render_queue(&mut self) {
@@ -164,8 +173,10 @@ impl OverlayManager {
             warn!("Repeating overlay keyframe");
             keyframe.pts = (Instant::now() + Duration::from_millis(75)).into();
 
-            if let Err((err, _)) = lazy_screen.push_frame(keyframe).await {
-                warn!("Sink rejected UI frame?: {err}");
+            if lazy_screen.push_frame(keyframe).await.is_ok() {
+                self.overlay_last_push = Some(Instant::now());
+            } else {
+                warn!("Sink rejected UI frame?");
                 // TODO: critical
             }
         }
@@ -180,14 +191,56 @@ impl OverlayManager {
                     frame.pts = (Instant::now() + Duration::from_millis(75)).into();
                     self.overlay_last_keyframe.replace(frame.clone());
 
-                    if let Err((err, _)) = lazy_screen.push_frame(frame).await {
-                        warn!("Sink rejected UI frame?: {err}");
+                    if lazy_screen.push_frame(frame).await.is_ok() {
+                        self.overlay_last_push = Some(Instant::now());
+                    } else {
+                        warn!("Sink rejected UI frame?");
                         // TODO: critical
                     }
                 }
             },
             Some(Err(err)) => error!("Failed to render overlay frame: {err}"),
             _ => {}
+        }
+    }
+
+    /// DIAGNOSTIC (MIB3 SCREEN_LOSS investigation): while the static overlay UI
+    /// is shown, the screen stream sends only keepalives after the initial
+    /// keyframe, and the A6 declares SCREEN_LOSS ~12 s after the last real
+    /// video frame. To test the no-frame watchdog hypothesis, re-send the
+    /// cached overlay keyframe every 5 s: a fresh access unit with a new
+    /// timestamp and a new encryption envelope (each push re-encrypts), NOT a
+    /// replay of an identical encrypted packet. Keepalives stay intact.
+    /// Remove once the hypothesis is settled.
+    const OVERLAY_IDR_TRICKLE_INTERVAL: Duration = Duration::from_secs(5);
+
+    async fn trickle_overlay_idr(&mut self) {
+        let Some(lazy_screen) = self.lazy_screen.as_mut() else {
+            return;
+        };
+        if self.overlay_current.is_none() {
+            return;
+        }
+        let Some(mut keyframe) = self.overlay_last_keyframe.clone() else {
+            return;
+        };
+
+        if !self
+            .overlay_last_push
+            .is_none_or(|t| t.elapsed() >= Self::OVERLAY_IDR_TRICKLE_INTERVAL)
+        {
+            return;
+        }
+
+        keyframe.pts = (Instant::now() + Duration::from_millis(75)).into();
+        match lazy_screen.push_frame(keyframe).await {
+            Ok(()) => {
+                self.overlay_last_push = Some(Instant::now());
+                info!("OVERLAY_IDR_TRICKLE — re-sent cached overlay keyframe (5 s trickle, DIAGNOSTIC)");
+            }
+            Err((err, _)) => {
+                warn!("Trickle: sink rejected overlay keyframe?: {err}");
+            }
         }
     }
 
@@ -211,6 +264,7 @@ impl OverlayManager {
                 // Overlay stays the same.
                 // Consider repeating the keyframe or ticking the UI animation if needed.
                 // self.overlay_current.unwrap().tick();
+                self.trickle_overlay_idr().await;
             }
             (_, Some(next)) => {
                 // Something new to render

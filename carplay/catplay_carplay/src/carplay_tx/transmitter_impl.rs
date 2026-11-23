@@ -350,7 +350,21 @@ impl AirPlayTransmitterImpl {
             .client
             .as_ref()
             .ok_or(RtspError::ProtocolViolation("client missing"))?;
-        let id = rand::random::<u64>().saturating_add(1);
+
+        // DIAGNOSTIC (MIB3 blank-screen A/B): force a fixed, POSITIVE streamConnectionID
+        // for the screen stream so the signed/unsigned decimal representation is
+        // unambiguous (signed == unsigned for positive values). This isolates the
+        // high-bit/signedness variable from the encryption-mode fix. Set to None to
+        // restore fully random IDs.
+        const DIAG_SCREEN_STREAM_ID: Option<u64> = Some(8_209_120_762_777_470_852);
+        let id = DIAG_SCREEN_STREAM_ID.unwrap_or_else(|| rand::random::<u64>().saturating_add(1));
+        if DIAG_SCREEN_STREAM_ID.is_some() {
+            warn!(
+                "DIAG: using fixed positive screen streamConnectionID {} (signed {})",
+                id,
+                id as i64
+            );
+        }
 
         let (session, sink) = ScreenTransmitSession::new(
             self.streams.cipher,

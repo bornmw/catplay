@@ -58,6 +58,8 @@ pub struct AirPlayTransmitterBootstrapSession {
 
     wants_pair_setup: bool,
     wants_auth_setup: bool,
+    /// Pair before the initial SETUP (see AirPlayTransmitterBootstrap::pair_first).
+    pair_first: bool,
 }
 
 type BootstrapResult = AirPlayTransmitterBootstrapResult<AirPlayTransmitterBootstrapStreams>;
@@ -224,6 +226,7 @@ impl AirPlayTransmitterBootstrapSession {
             bootstrap.remote_homekit_id,
             result_tx,
             bootstrap.controller_features,
+            bootstrap.pair_first,
         ));
         let helper = TcpHelper::connect_timeout(bootstrap.peer_ip, Self::TCP_CONN_TIMEOUT_RTSP, session)
             // Failed to initialize FDs
@@ -247,6 +250,7 @@ impl AirPlayTransmitterBootstrapSession {
         remote_uuid: Option<Uuid>,
         result_tx: BootstrapResultSender,
         controller_features: Vec<ControllerFeature>,
+        pair_first: bool,
     ) -> Self {
         let _features = [
             ControllerFeature::UiContext,
@@ -287,6 +291,8 @@ impl AirPlayTransmitterBootstrapSession {
 
             wants_auth_setup: true,
 
+            pair_first,
+
             aes_key: None,
             aes_key_encrypted: None,
             aes_iv: None,
@@ -300,6 +306,15 @@ impl AirPlayTransmitterBootstrapSession {
     }
 
     fn handle_pair_failure(&mut self, resp: BootstrapResult) {
+        if self.pair_first {
+            // Pairing is preferred, but not fatal: fall back to the unencrypted (et:NONE)
+            // SETUP so the session can still progress and be observed. A real shared
+            // secret was not established, so the remote may still be unable to decrypt.
+            let err = resp.err().map(|e| e.to_string());
+            warn!("pair_first: HomeKit pairing failed ({err:?}); falling back to unencrypted (et:NONE) SETUP");
+            self.start_setup_task();
+            return;
+        }
         self.send_result(resp);
     }
 
@@ -539,10 +554,19 @@ impl EventSink<RtspTransmitterEvent, ()> for AirPlayTransmitterBootstrapSession 
             RtspTransmitterEvent::SetBindIp(ip) => self.bind_ip = ip,
             RtspTransmitterEvent::SetPeerIp(ip) => self.peer_ip = ip,
             RtspTransmitterEvent::Connected => {
-                debug!("Connected - starting pairing flow");
-                self.start_setup_task();
-                // self.start_auth_setup_task();
-                // self.start_pair_task();
+                if self.pair_first {
+                    // Pair (HomeKit pair-verify, falling back to pair-setup) BEFORE the
+                    // initial SETUP so media streams use a real ChaCha shared secret,
+                    // like a real iPhone. On success the `Encrypted` event below starts
+                    // the SETUP with the shared secret.
+                    info!("Connected - pair_first: running HomeKit pairing before SETUP");
+                    self.start_pair_task();
+                } else {
+                    debug!("Connected - starting pairing flow");
+                    self.start_setup_task();
+                    // self.start_auth_setup_task();
+                    // self.start_pair_task();
+                }
             }
             RtspTransmitterEvent::Encrypted { shared_secret } => {
                 debug!("Paired - starting SETUP/info flow");

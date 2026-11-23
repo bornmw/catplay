@@ -26,6 +26,11 @@ pub struct AirPlayTransmitterBootstrap {
     pub controller_features: Vec<ControllerFeature>,
     /// HomeKit UUID of the remote(from Bonjour); used for fast-path in the pairing flow.
     pub remote_homekit_id: Option<Uuid>,
+    /// When true, run HomeKit pairing (pair-verify, falling back to pair-setup)
+    /// BEFORE the initial SETUP, so media streams use a real ChaCha shared secret.
+    /// When false, attempt an unencrypted (et:NONE) SETUP first and only pair if the
+    /// remote rejects it (existing behavior, kept for legacy receivers).
+    pub pair_first: bool,
 }
 
 #[derive(thiserror::Error, Debug, Clone, PartialEq)]

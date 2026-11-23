@@ -238,6 +238,7 @@ impl Reconcilable for ProdGadget {
                 "aa:bb:cc:dd:ee:ff",
                 self.cfg.udc_tx.as_deref(),
                 self.cfg.homekit_tx.clone(),
+                self.cfg.mfi.clone(),
                 false,
             )
             .map_err(|err| LocalError::FailedToSetupUsbClient(err))?;

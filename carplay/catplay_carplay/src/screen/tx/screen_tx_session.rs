@@ -25,6 +25,20 @@ pub enum ScreenTransmitOp {
     TransmitterDropped,
 }
 
+/// Shared screen-stream diagnostics.
+///
+/// The session updates it after each successfully written packet; the proxy
+/// exposes a snapshot so higher layers (e.g. the car manager at SCREEN_LOSS
+/// time) can report how stale the last real frame is without being coupled
+/// to the H.264 writer.
+#[derive(Default)]
+pub struct ScreenTxMetrics {
+    pub last_frame_sent: Option<Instant>,
+    pub last_keepalive_sent: Option<Instant>,
+    pub frames_sent: u64,
+    pub keepalives_sent: u64,
+}
+
 impl ScreenTransmitOp {
     pub fn is_frame(&self) -> bool {
         matches!(self, ScreenTransmitOp::Frame(_))
@@ -57,6 +71,8 @@ pub struct ScreenTransmitSession {
     queued_frames_sum: u64,
     queued_frames_samples: u64,
 
+    metrics: Arc<Mutex<ScreenTxMetrics>>,
+
     notify_frame_added: Notify,
     notify_frame_consumed: Notify,
 }
@@ -78,6 +94,7 @@ impl ScreenTransmitSession {
         let closed = Arc::new(Mutex::new(false));
         let notify_frame_added = Notify::new();
         let notify_frame_consumed = Notify::new();
+        let metrics = Arc::new(Mutex::new(ScreenTxMetrics::default()));
 
         let proxy = ScreenTransmitProxy::new(
             stream_latency,
@@ -86,6 +103,7 @@ impl ScreenTransmitSession {
             notify_frame_added.clone(),
             notify_frame_consumed.clone(),
             max_pending_frames,
+            metrics.clone(),
         );
 
         let me = Self {
@@ -105,10 +123,21 @@ impl ScreenTransmitSession {
             queued_frames_samples: 0,
 
             pending_ops,
+            metrics,
             notify_frame_added,
             notify_frame_consumed,
         };
         (me, proxy)
+    }
+
+    pub fn metrics_snapshot(&self) -> ScreenTxMetrics {
+        let m = self.metrics.lock().unwrap();
+        ScreenTxMetrics {
+            last_frame_sent: m.last_frame_sent,
+            last_keepalive_sent: m.last_keepalive_sent,
+            frames_sent: m.frames_sent,
+            keepalives_sent: m.keepalives_sent,
+        }
     }
 
     fn create_keep_alive(&mut self, now: Instant) -> ScreenFrame {
@@ -131,11 +160,7 @@ impl ScreenTransmitSession {
                 as u32,
             loss_avg: 0.0,
         };
-        let frame = ScreenFrame::keep_alive_with_stats(&stats);
-        if frame.header.opcode == ScreenOpCode::KeepAliveWithBody {
-            debug!("Sending screen keep alive with stats: {frame:?}");
-        }
-        frame
+        ScreenFrame::keep_alive_with_stats(&stats)
     }
 
     fn close(&mut self) {
@@ -181,14 +206,24 @@ impl TcpSession for ScreenTransmitSession {
                     sink.write(ScreenFrame::config(&config))?;
                 }
                 ScreenTransmitOp::Frame(frame) => {
-                    warn!("Flushing video frame pts={:?} keyframe={}", frame.pts, frame.is_known_keyframe());
+                    let is_keyframe = frame.is_known_keyframe();
+                    warn!("Flushing video frame pts={:?} keyframe={}", frame.pts, is_keyframe);
                     let screen_frame = ScreenFrame::video_proxied(frame, self.nal_size_len, self.clock.as_ref())
                         .map_err(|e| RtspError::UnexpectedState(format!("unexpected failure during NAL serialization: {e:?}")))?;
                     if self.keep_alive_send_stats_as_body {
                         self.frames_since_keepalive += 1;
                         self.bytes_since_keepalive += screen_frame.data.len() as u64;
                     }
+                    let bytes = screen_frame.data.len();
                     sink.write_composite(screen_frame)?;
+                    // Only a write that the socket accepted counts as "sent".
+                    let mut m = self.metrics.lock().unwrap();
+                    m.last_frame_sent = Some(Instant::now());
+                    m.frames_sent += 1;
+                    debug!(
+                        "SCREEN_FRAME_SENT frame_index={} keyframe={} bytes={} — video frame handed to the car socket",
+                        m.frames_sent, is_keyframe, bytes
+                    );
                     self.notify_frame_consumed.notify();
                 }
                 _ => {}
@@ -199,7 +234,15 @@ impl TcpSession for ScreenTransmitSession {
         // Send periodic keep-alives (if outside low-power mode)
         let now = Instant::now();
         if !self.keep_alive_interval.is_zero() && now > self.last_keepalive + self.keep_alive_interval {
-            sink.write(self.create_keep_alive(now))?;
+            let keepalive = self.create_keep_alive(now);
+            sink.write(keepalive)?;
+            let mut m = self.metrics.lock().unwrap();
+            m.last_keepalive_sent = Some(Instant::now());
+            m.keepalives_sent += 1;
+            debug!(
+                "SCREEN_KEEPALIVE_SENT count={} — screen keepalive handed to the car socket (not a real frame)",
+                m.keepalives_sent
+            );
         }
 
         if shutting_down {

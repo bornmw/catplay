@@ -128,11 +128,13 @@ impl EventSleeper for AltScreenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use catplay_carplay::screen::tx::ScreenTxMetrics;
     use catplay_util::notify::Notify;
     use futures::executor::block_on;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        Mutex,
     };
 
     const UUID: &str = "b7e6c5a0-2222-4000-8000-000000000002";
@@ -146,6 +148,7 @@ mod tests {
             Notify::new(),
             Notify::new(),
             1,
+            Arc::new(Mutex::new(ScreenTxMetrics::default())),
         );
         let torn_down = torn_down.clone();
         TeardownGuard::new(proxy, move || torn_down.store(true, Ordering::SeqCst))

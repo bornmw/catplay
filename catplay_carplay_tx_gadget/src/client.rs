@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use catplay_bonjour::BonjourEntry;
+use catplay_bonjour::{raw::to_scoped_addr, BonjourEntry};
 use catplay_carplay::{
     carplay_tx::{
         AirPlayTransmitterBootstrap, AirPlayTransmitterBootstrapError, AirPlayTransmitterBootstrapResult, AirPlayTransmitterProxy,
@@ -16,14 +16,16 @@ use catplay_carplay::{
 };
 use catplay_hap::HomekitStorageRef;
 use catplay_iap2_usb::GadgetResult;
+use catplay_mfi::MfiDeficeRef;
 use catplay_iap2_usb_host::{CarPlayPhoneGadget, CarPlayPhoneGadgetError, CarPlayPhoneGadgetStatus};
 use catplay_util::{
     ArcBox, AsyncShutdown, EventReconciler, EventSleeper, LazyAsync, Reconcilable, Reconciler, deadline_after, event_select,
     notify::Notify, sleeper,
 };
 use log::{debug, error, info, warn};
+use uuid::Uuid;
 
-use crate::carplay_client_session::CarPlayClientSession;
+use crate::carplay_client_session::{CarPlayClientSession, WiredStart};
 
 /// CarPlay transmitter (iPhone)
 pub struct CarPlayUsbClientGadget {
@@ -35,6 +37,10 @@ pub struct CarPlayUsbClientGadget {
     last_session_id: Option<String>,
     last_announce: Option<Instant>,
     ctrl_server: Option<CarPlayCtrlServer>,
+
+    // Wired session-start endpoint advertised by the accessory in 0x4301
+    // (set by the CSM session, consumed here to initiate a direct connection).
+    wired_start: Arc<Mutex<Option<WiredStart>>>,
 
     pending_connect: Option<LazyAsync<AirPlayTransmitterBootstrapResult<AirPlayTransmitterProxyRef>>>,
     pending_error: Option<AirPlayTransmitterBootstrapError>,
@@ -53,9 +59,17 @@ impl CarPlayUsbClientGadget {
         bonjour_id: &str,
         udc: Option<&str>,
         homekit: HomekitStorageRef,
+        mfi: Option<MfiDeficeRef>,
         pinned: bool,
     ) -> GadgetResult<Reconciler<Self>> {
-        let g = CarPlayPhoneGadget::new_with_csm(udc, iphone_instance, pinned, || CarPlayClientSession::default())?;
+        let wired_start: Arc<Mutex<Option<WiredStart>>> = Arc::new(Mutex::new(None));
+        let wired_start_for_session = wired_start.clone();
+        let g = CarPlayPhoneGadget::new_with_csm(
+            udc,
+            iphone_instance,
+            pinned,
+            move || CarPlayClientSession::new(mfi.clone(), Some(wired_start_for_session.clone())),
+        )?;
         Ok(Reconciler::new(
             Self {
                 g,
@@ -65,6 +79,7 @@ impl CarPlayUsbClientGadget {
                 last_announce: None,
 
                 ctrl_server: None,
+                wired_start,
                 pending_connect: None,
                 pending_transmitter: None,
                 pending_error: None,
@@ -93,12 +108,44 @@ impl CarPlayUsbClientGadget {
             // Features that can be proxied to an iPhone (only enabled towards the iPhone if also enabled by the car).
             controller_features: vec![ControllerFeature::AltScreen, ControllerFeature::ViewAreas],
             remote_homekit_id: invite.data.pi,
+            // Keep the legacy et:NONE-first behavior for the invite path.
+            pair_first: false,
         };
 
         self.pending_connect
             .replace(LazyAsync::new(move || AirPlayTransmitterProxy::connect(bootstrap)));
         Ok(())
     }
+
+    /// Path B: initiate a direct AirPlay connection to the accessory's wired
+    /// 0x4301 endpoint, reusing the same transmitter bootstrap as the invite path.
+    fn connect_wired(&mut self, ws: &WiredStart, iface: &str) -> ClientResult<()> {
+        let ifindex = iface_index(iface).unwrap_or(0);
+        let peer_ip = to_scoped_addr(ws.ip, ws.port, ifindex);
+        let remote_homekit_id = ws.homekit_id.as_deref().and_then(|s| Uuid::parse_str(s).ok());
+        let bootstrap = AirPlayTransmitterBootstrap {
+            homekit: self.homekit.clone(),
+            peer_ip,
+            controller_features: vec![ControllerFeature::AltScreen, ControllerFeature::ViewAreas],
+            remote_homekit_id,
+            // MIB3 accepts an et:NONE SETUP (200 OK) but cannot decrypt the resulting
+            // zero-key stream (blank screen). Pair first so the session uses a real
+            // ChaCha shared secret, exactly like a real iPhone.
+            pair_first: true,
+        };
+
+        info!("Wired AirPlay bootstrap: peer={peer_ip:?} homekit_id={remote_homekit_id:?}");
+        self.pending_connect
+            .replace(LazyAsync::new(move || AirPlayTransmitterProxy::connect(bootstrap)));
+        Ok(())
+    }
+}
+
+/// Resolve a network interface name to its index (used to scope link-local IPv6).
+fn iface_index(iface: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(iface).ok()?;
+    let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
+    (idx != 0).then_some(idx)
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -290,6 +337,7 @@ impl Reconcilable for CarPlayUsbClientGadget {
                 debug!("Shutting down old CarPlayCtrlServer");
                 ctrl_server.shutdown().await;
             }
+            self.wired_start.lock().unwrap().take();
 
             return Ok(CarPlayUsbClientGadgetStatus::WaitingForUsbAccessory);
         };
@@ -301,6 +349,8 @@ impl Reconcilable for CarPlayUsbClientGadget {
             }
 
             self.last_session_id.replace(session_id);
+            // Drop any wired-start endpoint from the previous session.
+            self.wired_start.lock().unwrap().take();
         }
 
         if self.ctrl_server.is_none() {
@@ -330,6 +380,23 @@ impl Reconcilable for CarPlayUsbClientGadget {
                     warn!("Droping excess invite")
                 }
             }
+        }
+
+        // Path B: the accessory started a WIRED session (0x4301) and advertised its
+        // AirPlay endpoint. Connect to it directly — in this case the accessory does
+        // not invite us via _carplay-ctrl. Only fire while idle (WaitingForInvite) and
+        // consume the endpoint so it cannot double-trigger.
+        let ws = self.wired_start.lock().unwrap().take();
+        if matches!(_status, CarPlayUsbClientGadgetStatus::WaitingForInvite)
+            && self.pending_connect.is_none()
+            && self.pending_transmitter.is_none()
+            && let Some(ws) = ws
+        {
+            info!("Wired CarPlay start: initiating direct connection on {iface}");
+            if let Err(err) = self.connect_wired(&ws, &iface) {
+                return Err(err)?;
+            }
+            return Ok(CarPlayUsbClientGadgetStatus::Connecting);
         }
 
         let now = Instant::now();

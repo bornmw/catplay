@@ -9,7 +9,7 @@ use log::debug;
 
 use crate::{
     screen::tx::{
-        screen_tx_session::ScreenTransmitOp,
+        screen_tx_session::{ScreenTransmitOp, ScreenTxMetrics},
         screen_tx_sink::{ScreenTransmitError, ScreenTransmitSink},
     },
     video::{AvccConfigExtended, EncodedVideoFrame},
@@ -24,6 +24,8 @@ pub struct ScreenTransmitProxy {
     max_queued_frames: usize,
     last_config: Option<AvccConfigExtended>,
 
+    metrics: Arc<Mutex<ScreenTxMetrics>>,
+
     needs_keyframe: bool,
 }
 
@@ -35,6 +37,7 @@ impl ScreenTransmitProxy {
         notify_frame_added: Notify,
         notify_frame_consumed: Notify,
         max_queue: usize,
+        metrics: Arc<Mutex<ScreenTxMetrics>>,
     ) -> Self {
         Self {
             stream_latency,
@@ -44,7 +47,20 @@ impl ScreenTransmitProxy {
             notify_frame_consumed,
             max_queued_frames: max_queue,
             last_config: None,
+            metrics,
             needs_keyframe: true,
+        }
+    }
+
+    /// Snapshot of the last-sent-frame / keepalive diagnostics (shared with the
+    /// screen session, updated on every successfully written packet).
+    pub fn metrics_snapshot(&self) -> ScreenTxMetrics {
+        let m = self.metrics.lock().unwrap();
+        ScreenTxMetrics {
+            last_frame_sent: m.last_frame_sent,
+            last_keepalive_sent: m.last_keepalive_sent,
+            frames_sent: m.frames_sent,
+            keepalives_sent: m.keepalives_sent,
         }
     }
 }

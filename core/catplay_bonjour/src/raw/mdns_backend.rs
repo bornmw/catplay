@@ -746,7 +746,7 @@ fn dns_name_key(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
-fn to_scoped_addr(ip: IpAddr, port: u16, ifindex: u32) -> SocketAddr {
+pub fn to_scoped_addr(ip: IpAddr, port: u16, ifindex: u32) -> SocketAddr {
     match ip {
         IpAddr::V4(v4) => SocketAddr::new(IpAddr::V4(v4), port),
         IpAddr::V6(v6) => {
