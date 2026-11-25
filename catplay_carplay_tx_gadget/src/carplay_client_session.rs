@@ -43,6 +43,9 @@ pub struct CarPlayClientSession {
     mfi: Option<MfiDeficeRef>,
     wired_start_tx: Option<Arc<Mutex<Option<WiredStart>>>>,
     nav_outbox: Arc<NavOutbox>,
+    /// Outbox generation published by this session's start(); invalidated
+    /// (session-scoped) on drop.
+    published_generation: Option<u32>,
 }
 
 impl Default for CarPlayClientSession {
@@ -54,6 +57,19 @@ impl Default for CarPlayClientSession {
             mfi: None,
             wired_start_tx: None,
             nav_outbox: NavOutbox::new(),
+            published_generation: None,
+        }
+    }
+}
+
+impl Drop for CarPlayClientSession {
+    fn drop(&mut self) {
+        // Session-scoped teardown: invalidate ONLY this session's
+        // generation. A stale teardown can therefore never clear a handle
+        // published by a newer session (invalidate_if_generation is a
+        // no-op when the generation has been superseded).
+        if let Some(pub_gen) = self.published_generation {
+            self.nav_outbox.invalidate_if_generation(pub_gen);
         }
     }
 }
@@ -64,11 +80,16 @@ impl CarPlayClientSession {
         wired_start_tx: Option<Arc<Mutex<Option<WiredStart>>>>,
         nav_outbox: Arc<NavOutbox>,
     ) -> Self {
+        // All fields explicit: `..Default::default()` is unavailable once
+        // the type implements Drop (no moving fields out of a dropping value).
         Self {
+            id: Default::default(),
+            start: None,
+            artwork_tx: None,
             mfi,
             wired_start_tx,
             nav_outbox,
-            ..Default::default()
+            published_generation: None,
         }
     }
 
@@ -743,7 +764,8 @@ impl CsmSession for CarPlayClientSession {
         // rewriter) can inject typed route-guidance packets into this
         // session. Bumps the outbox generation; a new iAP2 pipe always
         // creates a new session box, so this fires on every reconnect.
-        self.nav_outbox.publish(handle.clone());
+        let pub_gen = self.nav_outbox.publish(handle.clone());
+        self.published_generation = Some(pub_gen);
 
         if !handle.is_downgrade() {
             self.send(&StartIdentification::default(), &handle)?;
@@ -758,6 +780,15 @@ impl CsmSession for CarPlayClientSession {
         // debug! (was warn!): per-packet dumps filled the 768K /persist/log
         // partition in-car and lost the next session's logs (fix10).
         debug!("-> Incoming packet @ {:?}: {:?}", Instant::now() - self.start.unwrap(), packet);
+
+        // The car subscribing to route guidance (0x5200) is the precondition
+        // for the nav self-test's synthetic feed to mean anything.
+        if StartRouteGuidanceUpdates::cast(&packet).is_some()
+            && let Some(pub_gen) = self.published_generation
+        {
+            self.nav_outbox.mark_route_subscribed(pub_gen);
+            info!("RG_RX: StartRouteGuidanceUpdates (0x5200) from car — route guidance subscribed");
+        }
 
         if let Some(_id) = IdentificationInformation::cast(&packet) {
             self.id = _id.clone();

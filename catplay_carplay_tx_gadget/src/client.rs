@@ -50,10 +50,6 @@ pub struct CarPlayUsbClientGadget {
 
     transmitting: Arc<Mutex<bool>>,
     transmitting_end_notify: Notify,
-
-    /// Route-guidance injection channel (nav self-test); invalidated on
-    /// every session teardown/replacement so stale handles are never used.
-    nav_outbox: Arc<NavOutbox>,
 }
 
 impl CarPlayUsbClientGadget {
@@ -93,7 +89,6 @@ impl CarPlayUsbClientGadget {
                 pending_transmitter_error: None,
                 transmitting: Default::default(),
                 transmitting_end_notify: Default::default(),
-                nav_outbox,
             },
             Ok(CarPlayUsbClientGadgetStatus::Initial),
         ))
@@ -346,8 +341,12 @@ impl Reconcilable for CarPlayUsbClientGadget {
                 ctrl_server.shutdown().await;
             }
             self.wired_start.lock().unwrap().take();
-            // CarPlay pipe is gone — any captured handle is dead.
-            self.nav_outbox.invalidate();
+            // NOTE: no nav_outbox invalidation here. The outbox lifecycle is
+            // owned by the CSM session itself (publish in start(),
+            // invalidate-if-generation in Drop) — an unconditional
+            // invalidate on this reconcile tick could race a newer
+            // session's publication (the tick can land after the new
+            // session's start()).
 
             return Ok(CarPlayUsbClientGadgetStatus::WaitingForUsbAccessory);
         };

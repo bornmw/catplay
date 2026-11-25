@@ -97,6 +97,31 @@ mod tests {
         let decoded = registry.decode(&encoded).expect("RouteGuidanceManeuverInformation decode");
         assert_eq!(decoded.cast::<RouteGuidanceManeuverInformation>(), Some(&maneuver));
 
+        // The other synthetic variants the nav self-test emits:
+        // inactive 0x5201 (clean stop) and 0x5202 with junction exit angle.
+        let inactive = RouteGuidanceUpdate {
+            route_guidance_display_component_id: vec![1],
+            route_guidance_state: Some(RouteGuidanceState::NoRouteSetARouteIsNotSet),
+            ..RouteGuidanceUpdate::default()
+        };
+        let encoded = registry.encode(&inactive).expect("inactive RouteGuidanceUpdate encodable");
+        let decoded = registry.decode(&encoded).expect("inactive RouteGuidanceUpdate decode");
+        assert_eq!(decoded.cast::<RouteGuidanceUpdate>(), Some(&inactive));
+
+        let maneuver_angle = RouteGuidanceManeuverInformation {
+            route_guidance_display_component_id: 1,
+            index: 0,
+            maneuver_type: Some(ManeuverType::LeftTurnAngleIsBetween45And135Degrees),
+            after_maneuver_road_name: Some("Elm Street".into()),
+            junction_type: Some(catplay_csm::msg::iap2::JunctionType::Value0),
+            junction_element_exit_angle: Some(-90),
+            ..RouteGuidanceManeuverInformation::default()
+        };
+        let encoded =
+            registry.encode(&maneuver_angle).expect("angled RouteGuidanceManeuverInformation encodable");
+        let decoded = registry.decode(&encoded).expect("angled maneuver decode");
+        assert_eq!(decoded.cast::<RouteGuidanceManeuverInformation>(), Some(&maneuver_angle));
+
         let lanes = LaneGuidanceInformation {
             route_guidance_display_component_id: 1,
             lane_guidance_index: 0,

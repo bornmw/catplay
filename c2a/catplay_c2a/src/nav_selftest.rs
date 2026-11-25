@@ -55,6 +55,7 @@ const MANEUVER_INDEX: u16 = 0;
 /// Spawn the command-file poller. Lives for the process lifetime.
 pub fn spawn(outbox: Arc<NavOutbox>) {
     tokio::spawn(async move {
+        info!("RG_POLLER_READY: path={CMD_PATH} poll_ms={}", POLL_INTERVAL.as_millis());
         let stop = Arc::new(AtomicBool::new(false));
         let mut running: Option<tokio::task::JoinHandle<()>> = None;
         let mut ticker = tokio::time::interval(POLL_INTERVAL);
@@ -79,7 +80,7 @@ pub fn spawn(outbox: Arc<NavOutbox>) {
             match cmd.as_str() {
                 "start" => {
                     if running.is_some() {
-                        info!("RG_TEST_CMD: start ignored — self-test already running");
+                        warn!("RG_TEST_BUSY: start ignored — self-test already running");
                     } else {
                         stop.store(false, Ordering::Relaxed);
                         info!("RG_TEST_CMD: start");
@@ -117,24 +118,31 @@ async fn remove_command() {
 /// The 60 s staged timeline. Returns an error string when the run is
 /// aborted for an operator-visible reason (logged by the caller).
 async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(), String> {
-    // --- validate (0–5 s): wait for an active TX session to publish its
-    // handle (the CSM session's start() does that once per iAP2 pipe) ---
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let (handle, generation) = loop {
-        let (h, g) = outbox.snapshot();
-        if let Some(h) = h {
-            break (h, g);
+    // --- validate: wait for an active TX session to publish its handle
+    // (the CSM session's start() does that once per iAP2 pipe), then for
+    // the car's route-guidance subscription (0x5200, arrives after
+    // identification). 10 s total, distinct failure reasons.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let generation = loop {
+        let (h, g, subscribed) = outbox.snapshot();
+        if h.is_some() && subscribed {
+            break g;
         }
         if Instant::now() >= deadline {
-            return Err("no active TX session within 5 s (CarPlay not connected?)".to_string());
+            return if h.is_none() {
+                Err("no active TX session within 10 s (CarPlay not connected?)".to_string())
+            } else {
+                Err("car did not subscribe to route guidance (no 0x5200) within 10 s".to_string())
+            };
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
-    info!("RG_TEST_START: gen={generation} — stage A in 5 s");
+    info!("RG_TEST_START: gen={generation} subscribed=true — stage A in 5 s");
 
     let t0 = Instant::now();
-    let mut stage_a_sent = false;
-    let mut stage_c_sent = false;
+    let mut stage_a = false;
+    let mut stage_c = false;
+    let mut enqueued = 0u32;
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -143,10 +151,18 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
         let elapsed = t0.elapsed().as_secs() as u32;
 
         if elapsed >= RUN_SECS || stop.load(Ordering::Relaxed) {
-            send(&outbox, generation, &inactive_update()).await?;
+            // Clean stop: inactive 0x5201, but only to the same live
+            // session — never across a session boundary.
+            let reason = if elapsed >= RUN_SECS { "timeline complete" } else { "stop requested" };
+            match outbox.send_if_current(generation, &inactive_update()) {
+                Ok(()) => {
+                    enqueued += 1;
+                    info!("RG_TEST_STOP: {reason} — inactive route state enqueued, clean stop");
+                }
+                Err(_) => info!("RG_TEST_STOP: {reason} — session gone, cleanup skipped"),
+            }
             info!(
-                "RG_TEST_STOP: {} — inactive route state sent, clean stop",
-                if elapsed >= RUN_SECS { "timeline complete" } else { "stop requested" }
+                "RG_TEST_DONE: gen={generation} stage_a={stage_a} stage_c={stage_c} packets_enqueued={enqueued}"
             );
             return Ok(());
         }
@@ -161,12 +177,12 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
         let stage = elapsed / 15; // 0: validate, 1: A, 2: B, 3: C
         match stage {
             1 => {
-                if !stage_a_sent {
-                    send(&outbox, generation, &maneuver(false)).await?;
-                    stage_a_sent = true;
-                    info!("RG_TEST_STAGE_A: 0x5202 sent (left turn, 'Elm Street')");
+                if !stage_a {
+                    enqueue(&outbox, generation, &maneuver(false), &mut enqueued)?;
+                    stage_a = true;
+                    info!("RG_TEST_STAGE_A: 0x5202 enqueued (left turn, 'Elm Street')");
                 }
-                send(&outbox, generation, &active_update(500, 8000, 900, false)).await?;
+                enqueue(&outbox, generation, &active_update(500, 8000, 900, false), &mut enqueued)?;
             }
             2 => {
                 let e = elapsed.saturating_sub(20);
@@ -174,37 +190,34 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
                 let next_m = 500u32.saturating_sub(e * 5);
                 let dest_m = 8000u32.saturating_sub(e * 5);
                 let time_s = 900u64.saturating_sub(e as u64);
-                send(&outbox, generation, &active_update(next_m, dest_m, time_s, false)).await?;
+                enqueue(&outbox, generation, &active_update(next_m, dest_m, time_s, false), &mut enqueued)?;
             }
             3 => {
-                if !stage_c_sent {
-                    send(&outbox, generation, &maneuver(true)).await?;
-                    send(&outbox, generation, &lanes()).await?;
-                    stage_c_sent = true;
-                    info!("RG_TEST_STAGE_C: 0x5202 exit angle -90 + 0x5204 sent");
+                if !stage_c {
+                    enqueue(&outbox, generation, &maneuver(true), &mut enqueued)?;
+                    enqueue(&outbox, generation, &lanes(), &mut enqueued)?;
+                    stage_c = true;
+                    info!("RG_TEST_STAGE_C: 0x5202 exit angle -90 + 0x5204 enqueued");
                 }
                 let e = elapsed.saturating_sub(45);
                 // Continues from B's last tick (next=380).
                 let next_m = 380u32.saturating_sub(e * 5);
                 let dest_m = 7680u32.saturating_sub(e * 5);
                 let time_s = 876u64.saturating_sub(e as u64);
-                send(&outbox, generation, &active_update(next_m, dest_m, time_s, true)).await?;
+                enqueue(&outbox, generation, &active_update(next_m, dest_m, time_s, true), &mut enqueued)?;
             }
             _ => {} // 0–5 s: validate, quiet
         }
     }
 }
 
-/// Generation-checked send. Fails the run if the session went away since
-/// the snapshot was taken — never sends on a handle from a dead session.
-async fn send(outbox: &NavOutbox, generation: u32, packet: &dyn AsCsmPacket) -> Result<(), String> {
-    let (h, cur) = outbox.snapshot();
-    if cur != generation {
-        return Err(format!("generation changed ({generation} -> {cur}) before send"));
-    }
-    let h = h.ok_or_else(|| "handle disappeared before send".to_string())?;
-    h.send(packet)
-        .map_err(|e| format!("send failed: {e:?}"))
+/// Generation-checked enqueue (atomic with the validation inside the
+/// outbox). "Enqueued" is deliberate: this proves acceptance into the
+/// session's outbound queue, not delivery on the wire.
+fn enqueue(outbox: &NavOutbox, generation: u32, packet: &dyn AsCsmPacket, enqueued: &mut u32) -> Result<(), String> {
+    outbox
+        .send_if_current(generation, packet)
+        .map(|()| *enqueued += 1)
 }
 
 // --- packet builders -----------------------------------------------------
