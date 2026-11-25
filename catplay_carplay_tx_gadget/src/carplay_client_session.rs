@@ -16,6 +16,8 @@ use catplay_lingo::{
 };
 use catplay_mfi::MfiDeficeRef;
 use catplay_util::spawn_blocking;
+
+use crate::nav_outbox::NavOutbox;
 use log::{debug, info, warn};
 
 /// Wired CarPlay session start, as advertised by the accessory in a
@@ -34,26 +36,46 @@ pub struct WiredStart {
     pub homekit_id: Option<String>,
 }
 
-#[derive(Default)]
 pub struct CarPlayClientSession {
     id: IdentificationInformation,
     start: Option<Instant>,
     artwork_tx: Option<u8>,
     mfi: Option<MfiDeficeRef>,
     wired_start_tx: Option<Arc<Mutex<Option<WiredStart>>>>,
+    nav_outbox: Arc<NavOutbox>,
+}
+
+impl Default for CarPlayClientSession {
+    fn default() -> Self {
+        Self {
+            id: Default::default(),
+            start: None,
+            artwork_tx: None,
+            mfi: None,
+            wired_start_tx: None,
+            nav_outbox: NavOutbox::new(),
+        }
+    }
 }
 
 impl CarPlayClientSession {
-    pub fn new(mfi: Option<MfiDeficeRef>, wired_start_tx: Option<Arc<Mutex<Option<WiredStart>>>>) -> Self {
+    pub fn new(
+        mfi: Option<MfiDeficeRef>,
+        wired_start_tx: Option<Arc<Mutex<Option<WiredStart>>>>,
+        nav_outbox: Arc<NavOutbox>,
+    ) -> Self {
         Self {
             mfi,
             wired_start_tx,
+            nav_outbox,
             ..Default::default()
         }
     }
 
     pub fn send(&mut self, packet: &dyn AsCsmPacket, handle: &CsmClientHandleRef) -> CsmSessionResult<()> {
-        warn!(
+        // debug! (was warn!): per-packet dumps filled the 768K /persist/log
+        // partition in-car and lost the next session's logs (fix10).
+        debug!(
             "<- Outgoing packet @ {:?}: {:?}",
             Instant::now() - self.start.unwrap(),
             packet.as_csm()
@@ -712,13 +734,19 @@ impl CsmSession for CarPlayClientSession {
             .await
     }
 
-    async fn start(&mut self, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {
+    async fn start(&mut self, handle: CsmClientHandleRef) -> CsmSessionResult<()> {
         if self.start.is_none() {
             self.start.replace(Instant::now());
         }
 
-        if !_handle.is_downgrade() {
-            self.send(&StartIdentification::default(), &_handle)?;
+        // Publish the live handle so the nav self-test (and later the live
+        // rewriter) can inject typed route-guidance packets into this
+        // session. Bumps the outbox generation; a new iAP2 pipe always
+        // creates a new session box, so this fires on every reconnect.
+        self.nav_outbox.publish(handle.clone());
+
+        if !handle.is_downgrade() {
+            self.send(&StartIdentification::default(), &handle)?;
         }
         Ok(())
     }
@@ -727,7 +755,9 @@ impl CsmSession for CarPlayClientSession {
         if self.start.is_none() {
             self.start.replace(Instant::now());
         }
-        warn!("-> Incoming packet @ {:?}: {:?}", Instant::now() - self.start.unwrap(), packet);
+        // debug! (was warn!): per-packet dumps filled the 768K /persist/log
+        // partition in-car and lost the next session's logs (fix10).
+        debug!("-> Incoming packet @ {:?}: {:?}", Instant::now() - self.start.unwrap(), packet);
 
         if let Some(_id) = IdentificationInformation::cast(&packet) {
             self.id = _id.clone();

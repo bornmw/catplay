@@ -148,7 +148,11 @@ impl<T: RtspTransmitterCallback> TcpSession for RtspTransmitter<T> {
                 strace!(tracer, "Sending request: \n{}", req_for_trace);
             }
 
-            warn!("Sending request: \n{req}");
+            // debug! (was warn!): per-message multi-line dumps filled the
+            // 768K /persist/log partition in-car and lost the next session's
+            // logs (fix10). The strace!/CATPLAY_TRACING path keeps the deep
+            // dump available on demand.
+            debug!("Sending request: \n{req}");
         }
 
         sink.write(out)?;
@@ -181,7 +185,10 @@ impl<T: RtspTransmitterCallback> TcpSession for RtspTransmitter<T> {
                 strace!(tracer, "Received response: \n{}", resp_for_trace);
             }
 
-            warn!("Received response: \n{resp}");
+            // debug! (was warn!): per-message multi-line dumps filled the
+            // 768K /persist/log partition in-car (fix10); strace! keeps the
+            // deep dump available via CATPLAY_TRACING.
+            debug!("Received response: \n{resp}");
 
             self.rtsp_drain.feed(resp);
         }

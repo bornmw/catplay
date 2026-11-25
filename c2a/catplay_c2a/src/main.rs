@@ -54,6 +54,10 @@ async fn main() {
 
     info!("Calling start()");
 
+    // DIAGNOSTIC (fix10): pipeline progress counters + 2s HEALTH line +
+    // HANG_DETECTED. Remove after the hang is diagnosed.
+    catplay_c2a::diag::spawn_health_monitor();
+
     let mut main = Main::start().await;
     match main {
         Err(err) => {

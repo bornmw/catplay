@@ -153,8 +153,15 @@ impl OverlayManager {
                 }
                 let _ = consumed.send(());
             }
-            ScreenProxyOp::IphoneStreamStart { .. } => self.iphone_screen_active = true,
-            ScreenProxyOp::IphoneStreamFinish => self.iphone_screen_active = false,
+            ScreenProxyOp::IphoneStreamStart { .. } => {
+                // DIAGNOSTIC (fix10): a live iPhone screen stream = active session.
+                catplay_util::diag::diag().set_session_active(true);
+                self.iphone_screen_active = true
+            }
+            ScreenProxyOp::IphoneStreamFinish => {
+                catplay_util::diag::diag().set_session_active(false);
+                self.iphone_screen_active = false
+            }
             _ => {}
         }
     }

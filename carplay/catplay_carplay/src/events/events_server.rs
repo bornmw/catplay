@@ -10,11 +10,11 @@ use catplay_plist::CachingSerializer;
 use catplay_tokio::{CItem, TcpSession, TcpSink};
 use catplay_util::{AsyncShutdown, EventSleeper, EventToken};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use log::{debug, info, warn};
+use log::{debug, warn};
 
 use crate::{
     cipher::AirPlayCipherSaltType,
-    msg::{Command, CommandError, CommandType},
+    msg::{Command, CommandError},
     rtsp_frame::{HttpStatus, RtspError, RtspResponse, RtspResult},
     rtsp_transport::{AirPlayTransportCodec, RtspFrame},
 };
@@ -78,12 +78,6 @@ impl<T: EventServerCallback> EventsServer<T> {
     }
 
     async fn handle_request(handler: Arc<T>, cmd: Command) -> RtspResponse {
-        // DIAGNOSTIC (MIB3 in-car debug phase): HID reports from the car are the
-        // trigger for pairing acceptance, so log them at info! — the absence of
-        // this line in a log is itself the key evidence.
-        if cmd.get_type() == CommandType::HidSendReport {
-            info!("CAR_HID_RX: HidSendReport from car: {cmd:?}");
-        }
         debug!("Received command: {cmd:?}");
         handler.on_command(cmd).await
     }

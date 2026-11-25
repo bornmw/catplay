@@ -207,7 +207,9 @@ impl TcpSession for ScreenTransmitSession {
                 }
                 ScreenTransmitOp::Frame(frame) => {
                     let is_keyframe = frame.is_known_keyframe();
-                    warn!("Flushing video frame pts={:?} keyframe={}", frame.pts, is_keyframe);
+                    // debug! (was warn!): per-frame; SCREEN_FRAME_SENT below
+                    // (plus the fix10 diag counters) carries the signal.
+                    debug!("Flushing video frame pts={:?} keyframe={}", frame.pts, is_keyframe);
                     let screen_frame = ScreenFrame::video_proxied(frame, self.nal_size_len, self.clock.as_ref())
                         .map_err(|e| RtspError::UnexpectedState(format!("unexpected failure during NAL serialization: {e:?}")))?;
                     if self.keep_alive_send_stats_as_body {
@@ -224,6 +226,8 @@ impl TcpSession for ScreenTransmitSession {
                         "SCREEN_FRAME_SENT frame_index={} keyframe={} bytes={} — video frame handed to the car socket",
                         m.frames_sent, is_keyframe, bytes
                     );
+                    // DIAGNOSTIC (fix10): TX pipeline progress (car socket accepted the write).
+                    catplay_util::diag::diag().tx_video_add(1, bytes as u32);
                     self.notify_frame_consumed.notify();
                 }
                 _ => {}
@@ -243,6 +247,8 @@ impl TcpSession for ScreenTransmitSession {
                 "SCREEN_KEEPALIVE_SENT count={} — screen keepalive handed to the car socket (not a real frame)",
                 m.keepalives_sent
             );
+            // DIAGNOSTIC (fix10): TX pipeline progress (keepalive = car socket alive).
+            catplay_util::diag::diag().tx_keepalive();
         }
 
         if shutting_down {

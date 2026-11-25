@@ -4035,7 +4035,6 @@ packet_type! {
 }
 
 packet_type! {
-    @no_register
     strings = Iap2String;
     pub struct StartRouteGuidanceUpdates: 0x5200 {
         #[csm_id(0)]
@@ -4066,7 +4065,6 @@ packet_type! {
 }
 
 packet_type! {
-    @no_register
     strings = Iap2String;
     pub struct RouteGuidanceUpdate: 0x5201 {
         #[csm_id(0)]
@@ -4178,7 +4176,6 @@ packet_type! {
 }
 
 packet_type! {
-    @no_register
     strings = Iap2String;
     pub struct RouteGuidanceManeuverInformation: 0x5202 {
         #[csm_id(0)]
@@ -4236,7 +4233,6 @@ packet_type! {
 }
 
 packet_type! {
-    @no_register
     strings = Iap2String;
     pub struct StopRouteGuidanceUpdates: 0x5203 {
         #[csm_id(0)]
@@ -4247,7 +4243,6 @@ packet_type! {
 }
 
 packet_type! {
-    @no_register
     strings = Iap2String;
     pub struct LaneGuidanceInformation: 0x5204 {
         #[csm_id(0)]

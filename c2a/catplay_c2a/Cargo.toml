@@ -14,11 +14,8 @@ mimalloc = ["dep:mimalloc"]
 [dependencies]
 
 libc = "=1.0.0-alpha.4"
-# DIAGNOSTIC (MIB3 in-car debug phase): raise the release log ceiling so the
-# HID-chain / BlueZ pairing / screen-timing instrumentation is visible in
-# in-car logs. Revert to release_max_level_info once the debug phase ends.
 log = { version = "0.4.27", default-features = false, features = [
-    "release_max_level_debug",
+    "release_max_level_info",
 ] }
 macaddr = "1.0.1"
 

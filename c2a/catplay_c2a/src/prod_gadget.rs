@@ -10,6 +10,7 @@ use catplay_carplay::{
 };
 use catplay_carplay_rx_gadget::{CarPlayWirelessGadget, CarPlayWirelessGadgetError, CarPlayWirelessGadgetState};
 use catplay_carplay_tx_gadget::client::{CarPlayUsbClientGadget, CarPlayUsbClientGadgetError, CarPlayUsbClientGadgetStatus};
+use catplay_carplay_tx_gadget::nav_outbox::NavOutbox;
 use catplay_hap::HomekitStorageRef;
 use catplay_iap2_usb::GadgetError;
 use catplay_mfi::MfiDeficeRef;
@@ -233,6 +234,7 @@ impl Reconcilable for ProdGadget {
         }
 
         if self.tx.is_none() {
+            let nav_outbox = NavOutbox::new();
             let gadget = CarPlayUsbClientGadget::new(
                 "default",
                 "aa:bb:cc:dd:ee:ff",
@@ -240,9 +242,13 @@ impl Reconcilable for ProdGadget {
                 self.cfg.homekit_tx.clone(),
                 self.cfg.mfi.clone(),
                 false,
+                nav_outbox.clone(),
             )
             .map_err(|err| LocalError::FailedToSetupUsbClient(err))?;
             self.tx.replace(gadget);
+            // SSH-triggerable route-guidance self-test (off until
+            // `/run/catplay/navtest.cmd` says start).
+            crate::nav_selftest::spawn(nav_outbox);
         }
         let mut pending_transmitter = self.pending_transmitter.lock().await;
 

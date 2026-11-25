@@ -6,6 +6,7 @@ use catplay_carplay::{
 };
 use catplay_carplay_rx_gadget::{CarPlayUsbGadget, CarPlayUsbGadgetState};
 use catplay_carplay_tx_gadget::client::{CarPlayUsbClientGadget, CarPlayUsbClientGadgetStatus};
+use catplay_carplay_tx_gadget::nav_outbox::NavOutbox;
 use catplay_hap::HomekitStorageFile;
 use catplay_iap2_usb::gadget::GadgetHelper;
 use catplay_tracing::logger::setup_test_logger;
@@ -41,7 +42,7 @@ async fn test_gadget_handshake() -> Result<(), Box<dyn Error>> {
     let hk = HomekitStorageFile::memory();
     let hk_rx = HomekitStorageFile::memory();
 
-    let mut gadget = CarPlayUsbClientGadget::new("default", "bonjour_id", Some("dummy_udc.0"), hk.clone(), None, false)?;
+    let mut gadget = CarPlayUsbClientGadget::new("default", "bonjour_id", Some("dummy_udc.0"), hk.clone(), None, false, NavOutbox::new())?;
 
     let shared = AirPlayServerShared::new();
     let mut gadget_hu = CarPlayUsbGadget::new(hk_rx.clone(), None, shared, Some("dummy_udc.1"), false, "name", || MockSink {});

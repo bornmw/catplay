@@ -26,6 +26,7 @@ use log::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::carplay_client_session::{CarPlayClientSession, WiredStart};
+use crate::nav_outbox::NavOutbox;
 
 /// CarPlay transmitter (iPhone)
 pub struct CarPlayUsbClientGadget {
@@ -49,6 +50,10 @@ pub struct CarPlayUsbClientGadget {
 
     transmitting: Arc<Mutex<bool>>,
     transmitting_end_notify: Notify,
+
+    /// Route-guidance injection channel (nav self-test); invalidated on
+    /// every session teardown/replacement so stale handles are never used.
+    nav_outbox: Arc<NavOutbox>,
 }
 
 impl CarPlayUsbClientGadget {
@@ -61,14 +66,16 @@ impl CarPlayUsbClientGadget {
         homekit: HomekitStorageRef,
         mfi: Option<MfiDeficeRef>,
         pinned: bool,
+        nav_outbox: Arc<NavOutbox>,
     ) -> GadgetResult<Reconciler<Self>> {
         let wired_start: Arc<Mutex<Option<WiredStart>>> = Arc::new(Mutex::new(None));
         let wired_start_for_session = wired_start.clone();
+        let nav_outbox_for_session = nav_outbox.clone();
         let g = CarPlayPhoneGadget::new_with_csm(
             udc,
             iphone_instance,
             pinned,
-            move || CarPlayClientSession::new(mfi.clone(), Some(wired_start_for_session.clone())),
+            move || CarPlayClientSession::new(mfi.clone(), Some(wired_start_for_session.clone()), nav_outbox_for_session.clone()),
         )?;
         Ok(Reconciler::new(
             Self {
@@ -86,6 +93,7 @@ impl CarPlayUsbClientGadget {
                 pending_transmitter_error: None,
                 transmitting: Default::default(),
                 transmitting_end_notify: Default::default(),
+                nav_outbox,
             },
             Ok(CarPlayUsbClientGadgetStatus::Initial),
         ))
@@ -338,6 +346,8 @@ impl Reconcilable for CarPlayUsbClientGadget {
                 ctrl_server.shutdown().await;
             }
             self.wired_start.lock().unwrap().take();
+            // CarPlay pipe is gone — any captured handle is dead.
+            self.nav_outbox.invalidate();
 
             return Ok(CarPlayUsbClientGadgetStatus::WaitingForUsbAccessory);
         };
@@ -351,6 +361,9 @@ impl Reconcilable for CarPlayUsbClientGadget {
             self.last_session_id.replace(session_id);
             // Drop any wired-start endpoint from the previous session.
             self.wired_start.lock().unwrap().take();
+            // New iAP2 pipe ⇒ new session box; the previous handle is dead.
+            // The new session's start() re-publishes (bumping again).
+            self.nav_outbox.invalidate();
         }
 
         if self.ctrl_server.is_none() {

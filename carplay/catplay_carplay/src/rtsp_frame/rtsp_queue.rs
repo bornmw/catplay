@@ -88,6 +88,8 @@ impl RtspDrain {
             if let Some(sender) = { self.inner.pending_response.lock().unwrap().remove(&cseq) } {
                 let _ = sender.send(Ok(resp));
                 debug!("RTSP: fullfilling promise for cseq={cseq}");
+                // DIAGNOSTIC (fix10): RTSP control-plane progress.
+                catplay_util::diag::diag().rtsp_add();
             } else {
                 debug!("RTSP: unexpected response with cseq={cseq} (future was dropped?)");
             }

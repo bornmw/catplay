@@ -67,6 +67,8 @@ impl ScreenReceiverSink for ScreenProxy {
     }
 
     async fn process_frame(&mut self, frame: EncodedVideoFrame) -> RtspResult<()> {
+        // DIAGNOSTIC (fix10): RX pipeline progress (every frame from the iPhone).
+        catplay_util::diag::diag().rx_video_add(1, frame.data.len() as u32);
         let os = oneshot::channel();
         if self
             .channel

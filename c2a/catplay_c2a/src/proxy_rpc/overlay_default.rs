@@ -74,13 +74,15 @@ impl OverlayPolicy for OverlayPolicyDefault {
             }
 
             // Periodic summary while the request is pending (once per second).
+            // debug!: pairing is proven working (fix9); kept for regression
+            // diagnosis, invisible at the release info ceiling.
             let now = Instant::now();
             if self
                 .last_state_log
                 .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
             {
                 self.last_state_log = Some(now);
-                info!(
+                debug!(
                     "BT_PAIR_STATE pending=true remote_mac={} passkey={:06} age_ms={} overlay_visible=true — pairing request still pending (car touch + iPhone 'Pair' both required)",
                     req.remote_mac,
                     req.passkey,

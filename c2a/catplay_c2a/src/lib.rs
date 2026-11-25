@@ -2,9 +2,11 @@
 
 mod config;
 mod cp_output_manager;
+pub mod diag;
 mod homekit_manager;
 mod main_init;
 mod mfi_manager;
+pub mod nav_selftest;
 mod prod_gadget;
 pub mod proxy;
 mod ui;
