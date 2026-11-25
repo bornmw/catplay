@@ -86,7 +86,9 @@ pub fn spawn(outbox: Arc<NavOutbox>) {
                         let outbox = outbox.clone();
                         let stop = stop.clone();
                         running.replace(tokio::spawn(async move {
-                            let _ = run_selftest(outbox, stop).await;
+                            if let Err(err) = run_selftest(outbox, stop).await {
+                                warn!("RG_TEST_FAIL: {err}");
+                            }
                         }));
                     }
                 }
@@ -115,10 +117,19 @@ async fn remove_command() {
 /// The 60 s staged timeline. Returns an error string when the run is
 /// aborted for an operator-visible reason (logged by the caller).
 async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(), String> {
-    // --- validate (0–5 s) ---
-    let (handle, generation) = outbox.snapshot();
-    handle
-        .ok_or_else(|| "no active TX session (CarPlay not connected?)".to_string())?;
+    // --- validate (0–5 s): wait for an active TX session to publish its
+    // handle (the CSM session's start() does that once per iAP2 pipe) ---
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (handle, generation) = loop {
+        let (h, g) = outbox.snapshot();
+        if let Some(h) = h {
+            break (h, g);
+        }
+        if Instant::now() >= deadline {
+            return Err("no active TX session within 5 s (CarPlay not connected?)".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
     info!("RG_TEST_START: gen={generation} — stage A in 5 s");
 
     let t0 = Instant::now();

@@ -361,9 +361,14 @@ impl Reconcilable for CarPlayUsbClientGadget {
             self.last_session_id.replace(session_id);
             // Drop any wired-start endpoint from the previous session.
             self.wired_start.lock().unwrap().take();
-            // New iAP2 pipe ⇒ new session box; the previous handle is dead.
-            // The new session's start() re-publishes (bumping again).
-            self.nav_outbox.invalidate();
+            // NOTE: no nav_outbox.invalidate() here. The CSM session's
+            // start() (which publishes the live handle) can fire either
+            // before or after this reconcile observation depending on
+            // timing — invalidating here would race and wipe a
+            // freshly-published handle of a live session. Stale-session
+            // safety comes from the generation bump inside publish()
+            // itself; teardown is covered by the invalidate() in the
+            // gadget-inactive branch below.
         }
 
         if self.ctrl_server.is_none() {
