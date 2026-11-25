@@ -783,11 +783,17 @@ impl CsmSession for CarPlayClientSession {
 
         // The car subscribing to route guidance (0x5200) is the precondition
         // for the nav self-test's synthetic feed to mean anything.
-        if StartRouteGuidanceUpdates::cast(&packet).is_some()
-            && let Some(pub_gen) = self.published_generation
-        {
-            self.nav_outbox.mark_route_subscribed(pub_gen);
-            info!("RG_RX: StartRouteGuidanceUpdates (0x5200) from car — route guidance subscribed");
+        if let Some(sub) = StartRouteGuidanceUpdates::cast(&packet) {
+            if let Some(pub_gen) = self.published_generation {
+                self.nav_outbox.mark_route_subscribed(pub_gen);
+            }
+            info!(
+                "RG_RX_START_5200: components={:?} source_name={:?} source_supports={:?} exit_info={:?}",
+                sub.route_guidance_display_component_id,
+                sub.source_name,
+                sub.source_supports_route_guidance,
+                sub.supports_exit_info,
+            );
         }
 
         if let Some(_id) = IdentificationInformation::cast(&packet) {
@@ -890,6 +896,12 @@ impl CsmSession for CarPlayClientSession {
                     },
                     &_handle,
                 )?;
+                info!("RG_TX_DEVICE_UUID: sent (0x{:04X})", DeviceUUIDUpdate::PACKET_ID);
+            } else {
+                info!(
+                    "RG_TX_DEVICE_UUID: NOT sent — car does not advertise 0x{:04X}",
+                    DeviceUUIDUpdate::PACKET_ID
+                );
             }
             if self.id.wants_rx(DeviceLanguageUpdate::PACKET_ID) {
                 self.send(
@@ -898,6 +910,12 @@ impl CsmSession for CarPlayClientSession {
                     },
                     &_handle,
                 )?;
+                info!("RG_TX_DEVICE_LANG: sent (0x{:04X})", DeviceLanguageUpdate::PACKET_ID);
+            } else {
+                info!(
+                    "RG_TX_DEVICE_LANG: NOT sent — car does not advertise 0x{:04X}",
+                    DeviceLanguageUpdate::PACKET_ID
+                );
             }
             if self.id.wants_rx(DeviceInformationUpdate::PACKET_ID) {
                 self.send(
@@ -906,6 +924,12 @@ impl CsmSession for CarPlayClientSession {
                     },
                     &_handle,
                 )?;
+                info!("RG_TX_DEVICE_INFO: sent (0x{:04X})", DeviceInformationUpdate::PACKET_ID);
+            } else {
+                info!(
+                    "RG_TX_DEVICE_INFO: NOT sent — car does not advertise 0x{:04X}",
+                    DeviceInformationUpdate::PACKET_ID
+                );
             }
             // MIB3 advertises CarPlayAvailability (0x4300) in
             // messages_received_from_device and CarPlayStartSession (0x4301) in
@@ -930,6 +954,9 @@ impl CsmSession for CarPlayClientSession {
                     },
                     &_handle,
                 )?;
+                info!("RG_TX_CARPLAY_AVAILABILITY: sent");
+            } else {
+                info!("RG_TX_CARPLAY_AVAILABILITY: NOT sent — gate closed");
             }
             if self
                 .id
@@ -944,6 +971,12 @@ impl CsmSession for CarPlayClientSession {
                     },
                     &_handle,
                 )?;
+                info!("RG_TX_TRANSPORT_ID: sent (0x{:04X})", DeviceTransportIdentifierNotification::PACKET_ID);
+            } else {
+                info!(
+                    "RG_TX_TRANSPORT_ID: NOT sent — car does not advertise 0x{:04X}",
+                    DeviceTransportIdentifierNotification::PACKET_ID
+                );
             }
 
             if self.id.wants_rx(DeviceTimeUpdate::PACKET_ID) {

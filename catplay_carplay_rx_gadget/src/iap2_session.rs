@@ -8,9 +8,13 @@ use log::{debug, info, warn};
 use macaddr::MacAddr6;
 
 use catplay_csm::{
-    decoder::{CsmFlag, CsmPacketBox, CsmPacketId, CsmPacketUtil},
+    decoder::{CsmFlag, CsmPacketBox, CsmPacketId},
     msg::*,
 };
+
+/// M1: maximum RG_BOOT_RX summary lines per session (log-partition budget:
+/// ~50 bytes/line * 200 = ~10 KB worst case, vs the 768 K partition).
+const BOOT_RX_MAX: u32 = 200;
 
 /// A CSM session to connect with iPhone's iAP2 over USB, Bluetooth(Wi-Fi details advertisement only), or AirPlay RTSP transports.
 pub struct CarPlayServerSession {
@@ -27,6 +31,11 @@ pub struct CarPlayServerSession {
     cover_art_transfer_start: Option<Instant>,
 
     gps_sub: bool,
+
+    // M1 bootstrap capture state: bounded by BOOT_RX_MAX lines and the
+    // 15 s window (see respond()).
+    boot_rx_logged: u32,
+    boot_rx_done: bool,
 
     events_rx: mpsc::UnboundedReceiver<CarPlayServerSessionEventRx>,
     events_tx: mpsc::UnboundedSender<CarPlayServerSessionEventTx>,
@@ -236,6 +245,8 @@ impl CarPlayServerSession {
                 events_rx: events_rx0,
                 events_tx: events_tx1,
                 gps_sub: false,
+                boot_rx_logged: 0,
+                boot_rx_done: false,
             },
             events_tx0,
             events_rx1,
@@ -439,18 +450,58 @@ impl CsmSession for CarPlayServerSession {
     async fn respond(&mut self, packet: CsmPacketBox, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {
         debug!("Received from iPhone @ {:?}: {:?}", Instant::now() - self.start, packet);
 
-        // Route-guidance diagnostics (M1): capture the REAL device's
-        // bootstrap behavior — the full device IdentificationInformation
-        // (once per session) plus every packet during the first 15 s.
-        // This is the in-firmware stand-in for a USB capture: it tells us
-        // exactly what a real iPhone declares and sends that our emulated
-        // iPhone (TX gadget) does not. Bounded: one dump + ~15 s of lines.
+        // Route-guidance diagnostics (M1, revised per pre-flash review):
+        // capture the REAL device's behavior in bounded, fixed-size lines
+        // (an unbounded per-packet Debug dump was the fix10 partition-
+        // exhaustion risk). Two parts:
+        //   1) RG_BOOT_RX — type summary of every packet in the first 15 s,
+        //      capped at BOOT_RX_MAX lines, terminated by RG_BOOT_RX_DONE.
+        //   2) RG_RX_52xx — structured summaries of the real iPhone's route
+        //      guidance for the WHOLE session: the M2 comparison data
+        //      (what a genuine iPhone sends as 0x5201/0x5202/0x5203/0x5204).
+        // Note: a device never sends IdentificationInformation (the iAP2
+        // flow is StartIdentification -> accessory ID -> Accepted), so no
+        // device-identification capture exists by design.
         let since = Instant::now() - self.start;
-        if IdentificationInformation::cast(&packet).is_some() {
-            info!("RG_DEV_ID: device IdentificationInformation: {packet:?}");
+        if !self.boot_rx_done {
+            if since < Duration::from_secs(15) && self.boot_rx_logged < BOOT_RX_MAX {
+                self.boot_rx_logged += 1;
+                // Type name from the Debug repr's first token (the repr is
+                // only formatted, never logged) + wire payload length.
+                let d = format!("{packet:?}");
+                let name = d.split(' ').next().unwrap_or("<unknown>");
+                info!("RG_BOOT_RX @ {:?}: {name} len={}", since, packet.measure());
+            } else {
+                self.boot_rx_done = true;
+                info!("RG_BOOT_RX_DONE: lines={} (15 s window closed or cap {})", self.boot_rx_logged, BOOT_RX_MAX);
+            }
         }
-        if since < Duration::from_secs(15) {
-            info!("RG_BOOT_RX @ {:?}: {packet:?}", since);
+
+        if let Some(u) = packet.cast::<RouteGuidanceUpdate>() {
+            info!(
+                "RG_RX_5201 @ {:?}: state={:?} current_list={:?} total={:?} source={:?}",
+                since,
+                u.route_guidance_state,
+                u.route_guidance_maneuver_current_list,
+                u.route_guidance_maneuver_total_count,
+                u.source_name,
+            );
+        }
+        if let Some(m) = packet.cast::<RouteGuidanceManeuverInformation>() {
+            info!(
+                "RG_RX_5202 @ {:?}: index={} type={:?} after_road={:?} dist_m={:?}",
+                since, m.index, m.maneuver_type, m.after_maneuver_road_name, m.distance_between_maneuver
+            );
+        }
+        if packet.cast::<StopRouteGuidanceUpdates>().is_some() {
+            info!("RG_RX_5203 @ {:?}: StopRouteGuidanceUpdates", since);
+        }
+        if let Some(l) = packet.cast::<LaneGuidanceInformation>() {
+            info!("RG_RX_5204 @ {:?}: index={} lanes={}", since, l.lane_guidance_index, l.lane_information.len());
+        }
+
+        if packet.cast::<IdentificationAccepted>().is_some() {
+            info!("RG_RX_IDENT_ACCEPTED @ {:?}: device accepted dongle identification", since);
         }
 
         // if let Some(_) = packet.cast::<IdentificationAccepted>() {
@@ -466,6 +517,7 @@ impl CsmSession for CarPlayServerSession {
 
         if let Some(start_location) = packet.cast::<StartLocationInformation>() {
             self.gps_sub = true;
+            info!("RG_RX_LOCATION_START @ {:?}: device requests location updates (gps_sub on)", since);
             self.publish(CarPlayServerSessionEventTx::StartLocationInformation(start_location.clone()));
         }
 
@@ -475,6 +527,7 @@ impl CsmSession for CarPlayServerSession {
         }
 
         if packet.cast::<AuthenticationSucceeded>().is_some() {
+            info!("RG_RX_AUTH_SUCCEEDED @ {:?}: device authentication complete", since);
             // _handle.send(&StartPowerUpdates {
             //     maximum_current_drawn_from_accessory: CsmFlag::Yes,
             //     device_battery_will_charge_if_power_is_present: CsmFlag::Yes,

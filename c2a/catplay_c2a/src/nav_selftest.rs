@@ -233,25 +233,65 @@ const A6_MAX_CURRENT_ROAD: usize = 6;
 const A6_MAX_DESTINATION: usize = 6;
 const A6_MAX_AFTER_MANEUVER_ROAD: usize = 20;
 
-/// Pre-send validator: every synthetic packet must satisfy the A6's
-/// advertised caps. Fails the run (RG_TEST_FAIL) with the offending field.
+/// Pre-send validator: every synthetic packet variant used by the test
+/// must satisfy the A6's advertised caps and the internal index
+/// contracts (0x5201 current-list vs 0x5202 index; 0x5201 lane fields vs
+/// the 0x5204 block). Fails the run (RG_TEST_FAIL) with the offending
+/// field.
 fn validate_caps() -> Result<(), String> {
-    let u = active_update(500, 8000, 900, false);
-    if let Some(s) = &u.current_road_name {
-        if s.chars().count() > A6_MAX_CURRENT_ROAD {
-            return Err(format!("current_road_name '{s}' exceeds A6 cap {A6_MAX_CURRENT_ROAD}"));
+    // 0x5201 active — both lane modes (Stage C uses lanes=true).
+    for lanes in [false, true] {
+        let u = active_update(500, 8000, 900, lanes);
+        if let Some(s) = &u.current_road_name {
+            if s.chars().count() > A6_MAX_CURRENT_ROAD {
+                return Err(format!("current_road_name '{s}' exceeds A6 cap {A6_MAX_CURRENT_ROAD}"));
+            }
+        }
+        if let Some(s) = &u.destination_name {
+            if s.chars().count() > A6_MAX_DESTINATION {
+                return Err(format!("destination_name '{s}' exceeds A6 cap {A6_MAX_DESTINATION}"));
+            }
+        }
+        // The 0x5201 current-maneuver reference must match the 0x5202 index.
+        match &u.route_guidance_maneuver_current_list {
+            Some(list) if list.0 == [MANEUVER_INDEX] => {}
+            _ => return Err("0x5201 current_list must reference MANEUVER_INDEX".into()),
+        }
+        if lanes {
+            match (&u.lane_guidance_current_index, &u.lane_guidance_total_count) {
+                (Some(0), Some(1)) => {}
+                _ => return Err("0x5201 lane index/count inconsistent with the 0x5204 block".into()),
+            }
         }
     }
-    if let Some(s) = &u.destination_name {
-        if s.chars().count() > A6_MAX_DESTINATION {
-            return Err(format!("destination_name '{s}' exceeds A6 cap {A6_MAX_DESTINATION}"));
+    // 0x5201 inactive (clean stop) — no names, trivially within caps.
+    let inactive = inactive_update();
+    if inactive.current_road_name.is_some() || inactive.destination_name.is_some() {
+        return Err("inactive 0x5201 must carry no road/destination names".into());
+    }
+    // 0x5202 — both stage variants (plain + exit angle).
+    for exit_angle in [false, true] {
+        let m = maneuver(exit_angle);
+        if let Some(s) = &m.after_maneuver_road_name {
+            if s.chars().count() > A6_MAX_AFTER_MANEUVER_ROAD {
+                return Err(format!("after_maneuver_road_name '{s}' exceeds A6 cap {A6_MAX_AFTER_MANEUVER_ROAD}"));
+            }
+        }
+        // A6 caps maneuver_description at 0: the field must be absent.
+        if m.maneuver_description.is_some() {
+            return Err("maneuver_description set although A6 cap is 0".into());
+        }
+        if m.index != MANEUVER_INDEX {
+            return Err(format!("0x5202 index {} != MANEUVER_INDEX", m.index));
         }
     }
-    let m = maneuver(false);
-    if let Some(s) = &m.after_maneuver_road_name {
-        if s.chars().count() > A6_MAX_AFTER_MANEUVER_ROAD {
-            return Err(format!("after_maneuver_road_name '{s}' exceeds A6 cap {A6_MAX_AFTER_MANEUVER_ROAD}"));
-        }
+    // 0x5204 — A6 caps lane description at 0: the field must be absent.
+    let l = lanes();
+    if l.lane_guidance_description.is_some() {
+        return Err("lane_guidance_description set although A6 cap is 0".into());
+    }
+    if l.lane_guidance_index != 0 {
+        return Err(format!("0x5204 index {} != 0 (0x5201 references 0)", l.lane_guidance_index));
     }
     Ok(())
 }
