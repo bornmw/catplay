@@ -792,6 +792,38 @@ impl CsmSession for CarPlayClientSession {
 
         if let Some(_id) = IdentificationInformation::cast(&packet) {
             self.id = _id.clone();
+            // Route-guidance capability audit (M1): makes the car's declared
+            // display caps and 0x52xx message registration a greppable fact
+            // in every log. The M0 render-gap investigation showed the A6
+            // declares the component but registers no 0x52xx ids — track
+            // that permanently for every session.
+            let sent = IdentificationInformation::unpack_ids(&_id.messages_sent_by_accessory);
+            let rx = IdentificationInformation::unpack_ids(&_id.messages_received_from_device);
+            match _id.route_guidance_display_component.first() {
+                Some(rg) => info!(
+                    "RG_CAPABILITY_AUDIT: component_id={} max_current_road={} max_destination={} max_after_maneuver={} max_maneuver_desc={} maneuver_storage={} lane_storage={} | sent_5200={} sent_5203={} rx_5201={} rx_5202={} rx_5204={}",
+                    rg.identifier,
+                    rg.max_current_road_name_length.unwrap_or(0),
+                    rg.max_destination_name_length.unwrap_or(0),
+                    rg.max_after_maneuver_road_name_length.unwrap_or(0),
+                    rg.max_maneuver_description_length.unwrap_or(0),
+                    rg.max_guidance_maneuver_storage_capacity.unwrap_or(0),
+                    rg.max_lane_guidance_storage_capacity.unwrap_or(0),
+                    sent.contains(&StartRouteGuidanceUpdates::PACKET_ID),
+                    sent.contains(&StopRouteGuidanceUpdates::PACKET_ID),
+                    rx.contains(&RouteGuidanceUpdate::PACKET_ID),
+                    rx.contains(&RouteGuidanceManeuverInformation::PACKET_ID),
+                    rx.contains(&LaneGuidanceInformation::PACKET_ID),
+                ),
+                None => info!(
+                    "RG_CAPABILITY_AUDIT: no RouteGuidanceDisplayComponent in car identification | sent_5200={} sent_5203={} rx_5201={} rx_5202={} rx_5204={}",
+                    sent.contains(&StartRouteGuidanceUpdates::PACKET_ID),
+                    sent.contains(&StopRouteGuidanceUpdates::PACKET_ID),
+                    rx.contains(&RouteGuidanceUpdate::PACKET_ID),
+                    rx.contains(&RouteGuidanceManeuverInformation::PACKET_ID),
+                    rx.contains(&LaneGuidanceInformation::PACKET_ID),
+                ),
+            }
             let supports_modern_carplay =
                 IdentificationInformation::unpack_ids(&_id.messages_sent_by_accessory).contains(&CarPlayStartSession::PACKET_ID);
             debug!("Identification accepted! Modern CarPlay: {supports_modern_carplay}");

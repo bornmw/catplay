@@ -118,6 +118,10 @@ async fn remove_command() {
 /// The 60 s staged timeline. Returns an error string when the run is
 /// aborted for an operator-visible reason (logged by the caller).
 async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(), String> {
+    // M1: refuse to feed the car packets that violate its advertised
+    // display caps (the caller logs the reason as RG_TEST_FAIL).
+    validate_caps()?;
+
     // --- validate: wait for an active TX session to publish its handle
     // (the CSM session's start() does that once per iAP2 pipe), then for
     // the car's route-guidance subscription (0x5200, arrives after
@@ -220,6 +224,38 @@ fn enqueue(outbox: &NavOutbox, generation: u32, packet: &dyn AsCsmPacket, enqueu
         .map(|()| *enqueued += 1)
 }
 
+// --- cap validation (M1) --------------------------------------------------
+
+/// A6 C8 (MIB3P) advertised display caps — a contract, not a presentation
+/// hint (see RG_CAPABILITY_AUDIT in the logs). A native renderer may
+/// silently discard an update that exceeds them.
+const A6_MAX_CURRENT_ROAD: usize = 6;
+const A6_MAX_DESTINATION: usize = 6;
+const A6_MAX_AFTER_MANEUVER_ROAD: usize = 20;
+
+/// Pre-send validator: every synthetic packet must satisfy the A6's
+/// advertised caps. Fails the run (RG_TEST_FAIL) with the offending field.
+fn validate_caps() -> Result<(), String> {
+    let u = active_update(500, 8000, 900, false);
+    if let Some(s) = &u.current_road_name {
+        if s.chars().count() > A6_MAX_CURRENT_ROAD {
+            return Err(format!("current_road_name '{s}' exceeds A6 cap {A6_MAX_CURRENT_ROAD}"));
+        }
+    }
+    if let Some(s) = &u.destination_name {
+        if s.chars().count() > A6_MAX_DESTINATION {
+            return Err(format!("destination_name '{s}' exceeds A6 cap {A6_MAX_DESTINATION}"));
+        }
+    }
+    let m = maneuver(false);
+    if let Some(s) = &m.after_maneuver_road_name {
+        if s.chars().count() > A6_MAX_AFTER_MANEUVER_ROAD {
+            return Err(format!("after_maneuver_road_name '{s}' exceeds A6 cap {A6_MAX_AFTER_MANEUVER_ROAD}"));
+        }
+    }
+    Ok(())
+}
+
 // --- packet builders -----------------------------------------------------
 
 /// Active route, 0x5201. Km units (A6 is de-locale).
@@ -232,8 +268,10 @@ fn active_update(next_m: u32, dest_m: u32, time_s: u64, lanes: bool) -> RouteGui
         route_guidance_display_component_id: vec![COMPONENT_ID],
         route_guidance_state: Some(RouteGuidanceState::RouteSetARouteIsSet),
         maneuver_state: Some(ManeuverState::ContinueContinueAlongThisRouteUntilNextManeuver),
-        current_road_name: Some("Main St".into()),
-        destination_name: Some("Test Dest".into()),
+        // Within the A6's advertised caps (6/6 chars): a strict native
+        // renderer may silently drop updates that exceed them (M1).
+        current_road_name: Some("Main".into()),
+        destination_name: Some("Test".into()),
         estimated_time_of_arrival: Some(now.saturating_add(time_s)),
         time_remaining_to_destination: Some(time_s),
         distance_remaining: Some(dest_m),

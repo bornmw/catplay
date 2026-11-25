@@ -1,4 +1,4 @@
-use std::{fmt, time::Instant};
+use std::{fmt, time::{Duration, Instant}};
 
 use async_trait::async_trait;
 use catplay_iap2_client::{CsmClientHandleRef, CsmFileTransferEvent, CsmSession, CsmSessionResult, tokio::ClientSessionHelper};
@@ -8,7 +8,7 @@ use log::{debug, info, warn};
 use macaddr::MacAddr6;
 
 use catplay_csm::{
-    decoder::{CsmFlag, CsmPacketBox, CsmPacketId},
+    decoder::{CsmFlag, CsmPacketBox, CsmPacketId, CsmPacketUtil},
     msg::*,
 };
 
@@ -438,6 +438,20 @@ impl CsmSession for CarPlayServerSession {
 
     async fn respond(&mut self, packet: CsmPacketBox, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {
         debug!("Received from iPhone @ {:?}: {:?}", Instant::now() - self.start, packet);
+
+        // Route-guidance diagnostics (M1): capture the REAL device's
+        // bootstrap behavior — the full device IdentificationInformation
+        // (once per session) plus every packet during the first 15 s.
+        // This is the in-firmware stand-in for a USB capture: it tells us
+        // exactly what a real iPhone declares and sends that our emulated
+        // iPhone (TX gadget) does not. Bounded: one dump + ~15 s of lines.
+        let since = Instant::now() - self.start;
+        if IdentificationInformation::cast(&packet).is_some() {
+            info!("RG_DEV_ID: device IdentificationInformation: {packet:?}");
+        }
+        if since < Duration::from_secs(15) {
+            info!("RG_BOOT_RX @ {:?}: {packet:?}", since);
+        }
 
         // if let Some(_) = packet.cast::<IdentificationAccepted>() {
         //     _handle.send(&PowerSourceUpdate {
