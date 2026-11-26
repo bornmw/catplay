@@ -342,6 +342,9 @@ fn inactive_update() -> RouteGuidanceUpdate {
 }
 
 /// Maneuver, 0x5202. Stage C adds the exit angle (−90 = left).
+/// `exit_info` exercises the A6's native exit-label rendering (it
+/// advertises supports_exit_info: Yes) — treated as an opaque,
+/// pre-formatted label, exactly as a real iPhone sends it.
 fn maneuver(exit_angle: bool) -> RouteGuidanceManeuverInformation {
     RouteGuidanceManeuverInformation {
         route_guidance_display_component_id: COMPONENT_ID,
@@ -354,6 +357,7 @@ fn maneuver(exit_angle: bool) -> RouteGuidanceManeuverInformation {
         driving_side: Some(DrivingSide::RightOrAntiClockwiseForRoundabouts),
         junction_type: Some(JunctionType::Value0),
         junction_element_exit_angle: exit_angle.then_some(-90),
+        exit_info: Some("Exit 12A".into()),
         ..Default::default()
     }
 }
