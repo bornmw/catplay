@@ -182,57 +182,72 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
         let stage = elapsed / 15; // 0: validate, 1: A, 2: B, 3: C
         match stage {
             1 => {
-                // Highway exit stage: the HUD combo (production
-                // `nav_combo` format) replaces the street name and
-                // refreshes on a 5 s cadence with decreasing distance.
+                // INDEX-CHANGE PROBE, Stage A (index 0): first name, then a
+                // same-index replacement (expect NO repaint).
                 let e = elapsed.saturating_sub(5);
                 if !stage_a {
-                    enqueue(&outbox, generation, &maneuver_highway(), &mut enqueued)?;
+                    enqueue(&outbox, generation, &probe_maneuver(0, "Ext 30  3.2 km"), &mut enqueued)?;
                     stage_a = true;
-                    info!("RG_TEST_STAGE_A: 0x5202 highway exit ('I-87 North', exit_info 'Exit 30', 3200 m)");
+                    info!("RG_PROBE_A_FIRST: index=0 name='Ext 30  3.2 km'");
                 }
-                // 50 m/s synthetic approach; combo ticks at e=5 and e=10.
+                // Same-index replacement at e=5 (index 0, new name) — expect NO repaint.
+                if e == 5 {
+                    enqueue(&outbox, generation, &probe_maneuver(0, "Ext 30  2.7 km"), &mut enqueued)?;
+                    info!("RG_PROBE_A_SAME: index=0 name='Ext 30  2.7 km' (same-index replacement)");
+                }
                 let next_m = 3200u32.saturating_sub(e * 50);
-                if e > 0 && e % 5 == 0 {
-                    match crate::nav_combo::format_combo("Exit 30", next_m) {
-                        Some(combo) => {
-                            enqueue(&outbox, generation, &maneuver_combo(combo.clone()), &mut enqueued)?;
-                            info!("RG_TEST_COMBO: '{combo}' (meters={next_m})");
-                        }
-                        None => warn!("RG_TEST_COMBO: combo does not fit at {next_m} m — skipped"),
-                    }
-                }
                 let dest_m = 8000u32.saturating_sub(e * 50);
                 let time_s = 900u64.saturating_sub(e as u64);
-                enqueue(&outbox, generation, &active_update(next_m, dest_m, time_s, false), &mut enqueued)?;
+                enqueue(
+                    &outbox,
+                    generation,
+                    &active_update(next_m, dest_m, time_s, false, 0),
+                    &mut enqueued,
+                )?;
             }
             2 => {
-                // Urban stage: NO exit_info — the street name must stay.
+                // INDEX-CHANGE PROBE, Stage B (index 1): index change (expect
+                // REPAINT if index-keyed), then a same-index replacement on
+                // index 1 (expect NO repaint).
                 let e = elapsed.saturating_sub(20);
                 if !stage_b {
-                    enqueue(&outbox, generation, &maneuver(false), &mut enqueued)?;
+                    enqueue(&outbox, generation, &probe_maneuver(1, "Ext 30  2.2 km"), &mut enqueued)?;
                     stage_b = true;
-                    info!("RG_TEST_STAGE_B: 0x5202 urban ('Elm Street', no exit_info)");
+                    info!("RG_PROBE_B_CHANGE: index=1 name='Ext 30  2.2 km' (index 0->1)");
                 }
-                // 5 m/s: at e=14 (last B tick) next=380, dest=7930, time=886
-                let next_m = 500u32.saturating_sub(e * 5);
-                let dest_m = 8000u32.saturating_sub(e * 5);
-                let time_s = 900u64.saturating_sub(e as u64);
-                enqueue(&outbox, generation, &active_update(next_m, dest_m, time_s, false), &mut enqueued)?;
+                // Same-index replacement on index 1 at e=10 — expect NO repaint.
+                if e == 10 {
+                    enqueue(&outbox, generation, &probe_maneuver(1, "Elm Street"), &mut enqueued)?;
+                    info!("RG_PROBE_B_SAME: index=1 name='Elm Street' (same-index replacement)");
+                }
+                let next_m = 2200u32.saturating_sub(e * 50);
+                let dest_m = 7930u32.saturating_sub(e * 50);
+                let time_s = 886u64.saturating_sub(e as u64);
+                enqueue(
+                    &outbox,
+                    generation,
+                    &active_update(next_m, dest_m, time_s, false, 1),
+                    &mut enqueued,
+                )?;
             }
             3 => {
+                // INDEX-CHANGE PROBE, Stage C (index 2): another index change
+                // (expect REPAINT if index-keyed).
                 if !stage_c {
-                    enqueue(&outbox, generation, &maneuver(true), &mut enqueued)?;
-                    enqueue(&outbox, generation, &lanes(), &mut enqueued)?;
+                    enqueue(&outbox, generation, &probe_maneuver(2, "Exit 99  1.0 km"), &mut enqueued)?;
                     stage_c = true;
-                    info!("RG_TEST_STAGE_C: 0x5202 exit angle -90 + 0x5204 enqueued");
+                    info!("RG_PROBE_C_CHANGE: index=2 name='Exit 99  1.0 km' (index 1->2)");
                 }
                 let e = elapsed.saturating_sub(45);
-                // Continues from B's last tick (next=380).
-                let next_m = 380u32.saturating_sub(e * 5);
-                let dest_m = 7930u32.saturating_sub(e * 5);
-                let time_s = 886u64.saturating_sub(e as u64);
-                enqueue(&outbox, generation, &active_update(next_m, dest_m, time_s, true), &mut enqueued)?;
+                let next_m = 1000u32.saturating_sub(e * 50);
+                let dest_m = 7880u32.saturating_sub(e * 50);
+                let time_s = 881u64.saturating_sub(e as u64);
+                enqueue(
+                    &outbox,
+                    generation,
+                    &active_update(next_m, dest_m, time_s, false, 2),
+                    &mut enqueued,
+                )?;
             }
             _ => {} // 0–5 s: validate, quiet
         }
@@ -265,7 +280,7 @@ const A6_MAX_AFTER_MANEUVER_ROAD: usize = 20;
 fn validate_caps() -> Result<(), String> {
     // 0x5201 active — both lane modes (Stage C uses lanes=true).
     for lanes in [false, true] {
-        let u = active_update(500, 8000, 900, lanes);
+        let u = active_update(500, 8000, 900, lanes, MANEUVER_INDEX);
         if let Some(s) = &u.current_road_name {
             if s.chars().count() > A6_MAX_CURRENT_ROAD {
                 return Err(format!("current_road_name '{s}' exceeds A6 cap {A6_MAX_CURRENT_ROAD}"));
@@ -329,6 +344,19 @@ fn validate_caps() -> Result<(), String> {
     if l.lane_guidance_index != 0 {
         return Err(format!("0x5204 index {} != 0 (0x5201 references 0)", l.lane_guidance_index));
     }
+    // INDEX-CHANGE PROBE strings — every synthetic name must fit the A6
+    // after_maneuver cap (20) or the MIB3 may drop the whole 0x5202.
+    for name in [
+        "Ext 30  3.2 km",
+        "Ext 30  2.7 km",
+        "Ext 30  2.2 km",
+        "Elm Street",
+        "Exit 99  1.0 km",
+    ] {
+        if name.chars().count() > A6_MAX_AFTER_MANEUVER_ROAD {
+            return Err(format!("probe name '{name}' exceeds A6 cap {A6_MAX_AFTER_MANEUVER_ROAD}"));
+        }
+    }
     Ok(())
 }
 
@@ -344,8 +372,9 @@ fn check_maneuver_caps(m: &RouteGuidanceManeuverInformation) -> Result<(), Strin
 
 // --- packet builders -----------------------------------------------------
 
-/// Active route, 0x5201. Km units (A6 is de-locale).
-fn active_update(next_m: u32, dest_m: u32, time_s: u64, lanes: bool) -> RouteGuidanceUpdate {
+/// Active route, 0x5201. Km units (A6 is de-locale). `index` is the
+/// current-maneuver reference (must match the 0x5202 index being sent).
+fn active_update(next_m: u32, dest_m: u32, time_s: u64, lanes: bool, index: u16) -> RouteGuidanceUpdate {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -366,7 +395,7 @@ fn active_update(next_m: u32, dest_m: u32, time_s: u64, lanes: bool) -> RouteGui
         distance_remaining_to_next_maneuver: Some(next_m),
         distance_remaining_to_next_maneuver_display_string: Some(next_string(next_m)),
         distance_remaining_to_next_maneuver_display_units: Some(DistanceDisplayUnits::Km),
-        route_guidance_maneuver_current_list: Some(CsmPacked::from(vec![MANEUVER_INDEX])),
+        route_guidance_maneuver_current_list: Some(CsmPacked::from(vec![index])),
         route_guidance_maneuver_total_count: Some(1),
         route_guidance_visible_in_app: Some(true),
         present_lane_guidance: Some(lanes),
@@ -431,10 +460,29 @@ fn maneuver_highway() -> RouteGuidanceManeuverInformation {
 
 /// Highway maneuver with the HUD combo in after_maneuver_road_name
 /// (Stage A 5 s refreshes) — the production `nav_combo` format.
+#[allow(dead_code)] // superseded by the index-change probe (probe_maneuver)
 fn maneuver_combo(combo: String) -> RouteGuidanceManeuverInformation {
     RouteGuidanceManeuverInformation {
         after_maneuver_road_name: Some(combo),
         ..maneuver_highway()
+    }
+}
+
+/// INDEX-CHANGE PROBE maneuver: arbitrary index + arbitrary street name.
+/// Used to test whether a coordinated index bump (0x5202 new index +
+/// 0x5201 current-list pointing at it) forces the MIB3 to repaint.
+fn probe_maneuver(index: u16, name: &str) -> RouteGuidanceManeuverInformation {
+    RouteGuidanceManeuverInformation {
+        route_guidance_display_component_id: COMPONENT_ID,
+        index,
+        maneuver_type: Some(ManeuverType::LeftTurnAngleIsBetween45And135Degrees),
+        after_maneuver_road_name: Some(name.into()),
+        distance_between_maneuver: Some(3200),
+        distance_between_maneuver_display_string: Some("3.2".into()),
+        distance_between_maneuver_display_units: Some(DistanceDisplayUnits::Km),
+        driving_side: Some(DrivingSide::RightOrAntiClockwiseForRoundabouts),
+        junction_type: Some(JunctionType::Value0),
+        ..Default::default()
     }
 }
 
