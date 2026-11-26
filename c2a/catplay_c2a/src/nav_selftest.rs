@@ -1,12 +1,20 @@
 //! Built-in route-guidance self-test (M0).
 //!
 //! SSH-triggered via the command file `/run/catplay/navtest.cmd`
-//! (`"start"` / `"stop"`, polled every 250 ms — no listener, no CLI):
+//! (`"start"` / `"stop"` / `"rg-resubscribe"`, polled every 250 ms —
+//! no listener, no CLI):
 //!
 //! ```sh
 //! ssh dongle 'printf start > /run/catplay/navtest.cmd'
 //! ssh dongle 'printf stop  > /run/catplay/navtest.cmd'
 //! ```
+//!
+//! `rg-resubscribe` (Phase 1 diagnostic): re-sends the 0x5200
+//! route-guidance request on the current RX (iPhone) session — the
+//! subscription-timing test (trigger it while parked with Apple Maps
+//! navigation already running). Log markers: `RG_RX_5200_RESUB` (send)
+//! and `RG_RX_TRAFFIC` (whole-session iPhone CSM traffic histogram,
+//! 30 s flush — the answer to "did the iPhone send anything at all?").
 //!
 //! Runs a 60 s staged synthetic route through the live TX CSM session
 //! (typed packets through the normal serializer — never raw bytes):
@@ -33,6 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use catplay_carplay_rx_gadget::RouteGuidanceResub;
 use catplay_carplay_tx_gadget::nav_outbox::NavOutbox;
 use catplay_csm::decoder::{AsCsmPacket, CsmPacked};
 use catplay_csm::msg::{
@@ -53,7 +62,7 @@ const COMPONENT_ID: u16 = 1;
 const MANEUVER_INDEX: u16 = 0;
 
 /// Spawn the command-file poller. Lives for the process lifetime.
-pub fn spawn(outbox: Arc<NavOutbox>) {
+pub fn spawn(outbox: Arc<NavOutbox>, rg_resub: Option<RouteGuidanceResub>) {
     tokio::spawn(async move {
         info!("RG_POLLER_READY: path={CMD_PATH} poll_ms={}", POLL_INTERVAL.as_millis());
         let stop = Arc::new(AtomicBool::new(false));
@@ -97,6 +106,18 @@ pub fn spawn(outbox: Arc<NavOutbox>) {
                     info!("RG_TEST_CMD: stop");
                     stop.store(true, Ordering::Relaxed);
                 }
+                // Phase 1 diagnostic: re-send 0x5200 on the live RX
+                // session (subscription-timing test). Triggered while
+                // parked with Apple Maps navigation already running.
+                "rg-resubscribe" => match &rg_resub {
+                    Some(rg) => {
+                        let sent = rg.trigger();
+                        info!(
+                            "RG_TEST_CMD: rg-resubscribe — trigger delivered={sent} (watch for RG_RX_5200_RESUB, then RG_RX_5201/5202)"
+                        );
+                    }
+                    None => warn!("RG_TEST_CMD: rg-resubscribe — no RX session wiring"),
+                },
                 other => warn!("RG_TEST_CMD: unrecognized command file content {other:?}"),
             }
             remove_command().await;

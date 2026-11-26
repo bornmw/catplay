@@ -10,7 +10,7 @@ use catplay_carplay::{
 };
 use catplay_carplay_rx_gadget::{
     CarPlayWirelessGadget, CarPlayWirelessGadgetError, CarPlayWirelessGadgetState, RouteGuidanceEvent,
-    RouteGuidanceSink,
+    RouteGuidanceResub, RouteGuidanceSink,
 };
 use catplay_carplay_tx_gadget::client::{CarPlayUsbClientGadget, CarPlayUsbClientGadgetError, CarPlayUsbClientGadgetStatus};
 use catplay_carplay_tx_gadget::nav_outbox::NavOutbox;
@@ -212,6 +212,9 @@ impl Reconcilable for ProdGadget {
         // (dongle-as-car) publishes iPhone 0x52xx events here; the c2a
         // bridge task (spawned below with the TX outbox) consumes them.
         let (rg_tx, rg_rx) = mpsc::unbounded::<RouteGuidanceEvent>();
+        // Phase 1 diagnostic: 0x5200 resubscribe trigger (c2a command
+        // poller -> current RX session), stable across re-estabishments.
+        let rg_resub = RouteGuidanceResub::new();
 
         if self.rx.is_none() {
             self.rx.replace(CarPlayWirelessGadget::new(
@@ -227,6 +230,7 @@ impl Reconcilable for ProdGadget {
                 self.cfg.channel,
                 Some(&self.cfg.bt_cache_file),
                 Some(RouteGuidanceSink::new(rg_tx)),
+                Some(rg_resub.clone()),
                 {
                     let car = self.last_tx.clone();
 
@@ -256,8 +260,8 @@ impl Reconcilable for ProdGadget {
             .map_err(|err| LocalError::FailedToSetupUsbClient(err))?;
             self.tx.replace(gadget);
             // SSH-triggerable route-guidance self-test (off until
-            // `/run/catplay/navtest.cmd` says start).
-            crate::nav_selftest::spawn(nav_outbox.clone());
+            // `/run/catplay/navtest.cmd` says start / rg-resubscribe).
+            crate::nav_selftest::spawn(nav_outbox.clone(), Some(rg_resub));
             // Phase 1: live route-guidance bridge (iPhone -> A6, HUD combo).
             crate::nav_bridge::spawn(rg_rx, nav_outbox);
         }

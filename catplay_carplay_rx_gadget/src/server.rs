@@ -232,7 +232,7 @@ impl<T: AirPlayReceiverSink> Reconcilable for CarPlayUsbGadget<T> {
                     };
 
                     // Phase 1: no route-guidance bridge on the wired path.
-                    CarPlayServerSession::new(mfi.clone(), identity, None).0
+                    CarPlayServerSession::new(mfi.clone(), identity, None, None).0
                 })
                 .map_err(LocalError::StartingGadget)?;
                 self.usb_gadget.replace(gadget_hu);

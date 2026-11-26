@@ -18,7 +18,7 @@ use catplay_util::{
 use log::{debug, error, info, trace, warn};
 use macaddr::MacAddr6;
 
-use crate::{CarPlayServerSession, CarPlaySessionIdentity, RouteGuidanceSink};
+use crate::{CarPlayServerSession, CarPlaySessionIdentity, RouteGuidanceResub, RouteGuidanceSink};
 
 /// CarPlay HeadUnit (Wireless)
 pub struct CarPlayWirelessGadget<T: AirPlayReceiverSink> {
@@ -49,6 +49,8 @@ pub struct CarPlayWirelessGadget<T: AirPlayReceiverSink> {
 
     // Phase 1: route-guidance bridge feed for the c2a nav bridge.
     rg_sink: Option<RouteGuidanceSink>,
+    // Phase 1 diagnostic: 0x5200 resubscribe trigger (c2a -> session).
+    rg_resub: Option<RouteGuidanceResub>,
 
     invites_blocked: bool,
     last_mac: Option<MacAddr6>,
@@ -77,6 +79,8 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
         bt_last_connect_cache_file: Option<&str>,
         // Phase 1: route-guidance bridge feed (None = bridge not wired).
         rg_sink: Option<RouteGuidanceSink>,
+        // Phase 1 diagnostic: 0x5200 resubscribe trigger (None = disabled).
+        rg_resub: Option<RouteGuidanceResub>,
         sink: impl Fn() -> T + Send + Sync + 'static,
     ) -> Reconciler<Self> {
         Reconciler::new(
@@ -99,6 +103,7 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
                 shared,
                 sink: Arc::new(sink),
                 rg_sink,
+                rg_resub,
                 invites_blocked: false,
                 last_mac: None,
                 bt_last_connect_cache_file: bt_last_connect_cache_file.map(|p| p.into()),
@@ -337,6 +342,7 @@ impl<T: AirPlayReceiverSink> Reconcilable for CarPlayWirelessGadget<T> {
             LocalState::StartingBluetooth { hci, mac } => {
                 let mfi = self.mfi.clone();
                 let rg_sink = self.rg_sink.clone();
+                let rg_resub = self.rg_resub.clone();
                 let identity = CarPlaySessionIdentity {
                     display_name: self.name.clone(),
                     ncm_iface: None,
@@ -351,7 +357,7 @@ impl<T: AirPlayReceiverSink> Reconcilable for CarPlayWirelessGadget<T> {
                     ..CarPlaySessionIdentity::default()
                 };
 
-                let cb = move || CarPlayServerSession::new(mfi.clone(), identity.clone(), rg_sink.clone()).0;
+                let cb = move || CarPlayServerSession::new(mfi.clone(), identity.clone(), rg_sink.clone(), rg_resub.clone()).0;
                 let mut mgr = BluetoothManager::new(false, true, true, hci, cb);
                 mgr.start()
                     .await

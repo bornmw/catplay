@@ -1,9 +1,18 @@
-use std::{fmt, time::{Duration, Instant}};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use catplay_iap2_client::{CsmClientHandleRef, CsmFileTransferEvent, CsmSession, CsmSessionResult, tokio::ClientSessionHelper};
 use catplay_mfi::MfiDeficeRef;
 use catplay_util::mpsc;
+use futures::StreamExt;
 use log::{debug, info, warn};
 use macaddr::MacAddr6;
 
@@ -15,6 +24,10 @@ use catplay_csm::{
 /// M1: maximum RG_BOOT_RX summary lines per session (log-partition budget:
 /// ~50 bytes/line * 200 = ~10 KB worst case, vs the 768 K partition).
 const BOOT_RX_MAX: u32 = 200;
+
+/// Phase 1 diagnostic: flush interval for the whole-session RX traffic
+/// histogram (`RG_RX_TRAFFIC`) — one bounded line per interval.
+const RX_TRAFFIC_FLUSH_SECS: u64 = 30;
 
 /// Phase 1: the RouteGuidanceDisplayComponent identifier we declare to the
 /// iPhone (dongle-as-car). The bridge remaps it to the A6's id explicitly
@@ -52,6 +65,20 @@ pub struct CarPlayServerSession {
     /// The 0x5200 route-guidance request was sent exactly once
     /// (idempotent across the identification/auth callback order).
     rg_requested: bool,
+    /// Phase 1 diagnostic: resubscribe trigger (None = not wired).
+    rg_resub: Option<RouteGuidanceResub>,
+    /// Shared with the resubscribe watcher task: true once BOTH
+    /// identification-accepted and authentication-succeeded have been
+    /// seen (the 0x5200 re-send is gated on it, like the first send).
+    rg_ready: Arc<AtomicBool>,
+
+    // Phase 1 diagnostic: whole-session RX traffic histogram (type name
+    // -> count) flushed every RX_TRAFFIC_FLUSH_SECS — captures post-boot
+    // iPhone CSM activity (esp. 0x52xx) the 15 s RG_BOOT_RX window
+    // misses, at a cost of one log line per interval.
+    rx_traffic: BTreeMap<String, u32>,
+    rx_traffic_total: u32,
+    rx_traffic_since: Instant,
 
     events_rx: mpsc::UnboundedReceiver<CarPlayServerSessionEventRx>,
     events_tx: mpsc::UnboundedSender<CarPlayServerSessionEventTx>,
@@ -174,6 +201,44 @@ impl RouteGuidanceSink {
     }
 }
 
+/// Phase 1 diagnostic: trigger to re-send the 0x5200 route-guidance
+/// request on the CURRENT RX session (subscription-timing test — resend
+/// 0x5200 while parked with Apple Maps navigation already running). The
+/// sender side is stable across session re-estabishments: each new
+/// session registers its own trigger channel, the latest registration
+/// wins, and the previous session's watcher task dies with its receiver.
+#[derive(Clone)]
+pub struct RouteGuidanceResub {
+    current: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<()>>>>,
+}
+
+impl RouteGuidanceResub {
+    pub fn new() -> Self {
+        Self {
+            current: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// c2a side: trigger a 0x5200 re-send on the current session.
+    /// Returns false when there is no active session.
+    pub fn trigger(&self) -> bool {
+        let Some(tx) = self.current.lock().unwrap().clone() else {
+            return false;
+        };
+        tx.unbounded_send(()).is_ok()
+    }
+
+    /// Session side: create this session's trigger channel, register the
+    /// sender (replacing any previous registration — the old session is
+    /// gone: its receiver is dropped and its watcher task ends), and
+    /// return the receiver for the session's watcher task.
+    pub fn session_channel(&self) -> mpsc::UnboundedReceiver<()> {
+        let (tx, rx) = mpsc::unbounded();
+        *self.current.lock().unwrap() = Some(tx);
+        rx
+    }
+}
+
 #[derive(Default, Eq, PartialEq)]
 struct NowPlayingSummary {
     title: Option<String>,
@@ -276,6 +341,7 @@ impl CarPlayServerSession {
         mfi: Option<MfiDeficeRef>,
         identity: CarPlaySessionIdentity,
         rg_sink: Option<RouteGuidanceSink>,
+        rg_resub: Option<RouteGuidanceResub>,
     ) -> (
         Self,
         mpsc::UnboundedSender<CarPlayServerSessionEventRx>,
@@ -304,6 +370,11 @@ impl CarPlayServerSession {
                 id_accepted: false,
                 auth_succeeded: false,
                 rg_requested: false,
+                rg_resub,
+                rg_ready: Arc::new(AtomicBool::new(false)),
+                rx_traffic: BTreeMap::new(),
+                rx_traffic_total: 0,
+                rx_traffic_since: Instant::now(),
             },
             events_tx0,
             events_rx1,
@@ -315,6 +386,14 @@ impl CarPlayServerSession {
     fn drop_session(&mut self) {
         if let Some(sink) = &self.rg_sink {
             sink.push(RouteGuidanceEvent::Disconnected);
+        }
+    }
+
+    /// Both 0x5200 preconditions are met — the resubscribe watcher task
+    /// may send.
+    fn mark_rg_ready(&self) {
+        if self.id_accepted && self.auth_succeeded {
+            self.rg_ready.store(true, Ordering::Relaxed);
         }
     }
 
@@ -560,7 +639,36 @@ impl Drop for CarPlayServerSession {
 
 #[async_trait]
 impl CsmSession for CarPlayServerSession {
-    async fn start(&mut self, _handle: CsmClientHandleRef) -> CsmSessionResult<()> {
+    async fn start(&mut self, handle: CsmClientHandleRef) -> CsmSessionResult<()> {
+        // Phase 1 diagnostic: resubscribe watcher — re-sends 0x5200 on
+        // trigger (one-shot `rg-resubscribe` command). Runs independent
+        // of INCOMING traffic, so it works even when the iPhone is
+        // CSM-quiet (the boot log shows zero iPhone CSM traffic after the
+        // setup phase — polling a trigger in respond() would deadlock).
+        if let Some(rg_resub) = &self.rg_resub {
+            let mut rx = rg_resub.session_channel();
+            let handle = handle.clone();
+            let ready = self.rg_ready.clone();
+            tokio::spawn(async move {
+                while let Some(()) = rx.next().await {
+                    if !ready.load(Ordering::Relaxed) {
+                        warn!("RG_RX_5200_RESUB: ignored — identification/auth not complete");
+                        continue;
+                    }
+                    match handle.send(&StartRouteGuidanceUpdates {
+                        route_guidance_display_component_id: vec![RG_COMPONENT_ID],
+                        source_name: CsmFlag::Yes,
+                        source_supports_route_guidance: CsmFlag::Yes,
+                        supports_exit_info: CsmFlag::Yes,
+                        destination_time_zone_offset_minutes: CsmFlag::No,
+                        ev_charge_info: CsmFlag::No,
+                    }) {
+                        Ok(()) => info!("RG_RX_5200_RESUB: re-sent 0x5200 route-guidance request to iPhone"),
+                        Err(err) => warn!("RG_RX_5200_RESUB: send failed: {err}"),
+                    }
+                }
+            });
+        }
         Ok(())
     }
 
@@ -601,18 +709,40 @@ impl CsmSession for CarPlayServerSession {
         // flow is StartIdentification -> accessory ID -> Accepted), so no
         // device-identification capture exists by design.
         let since = Instant::now() - self.start;
+        // Type name from the Debug repr's first token (the repr is only
+        // formatted, never logged) — shared by the boot capture and the
+        // whole-session traffic histogram below.
+        let d = format!("{packet:?}");
+        let name = d.split(' ').next().unwrap_or("<unknown>");
         if !self.boot_rx_done {
             if since < Duration::from_secs(15) && self.boot_rx_logged < BOOT_RX_MAX {
                 self.boot_rx_logged += 1;
-                // Type name from the Debug repr's first token (the repr is
-                // only formatted, never logged) + wire payload length.
-                let d = format!("{packet:?}");
-                let name = d.split(' ').next().unwrap_or("<unknown>");
                 info!("RG_BOOT_RX @ {:?}: {name} len={}", since, packet.measure());
             } else {
                 self.boot_rx_done = true;
                 info!("RG_BOOT_RX_DONE: lines={} (15 s window closed or cap {})", self.boot_rx_logged, BOOT_RX_MAX);
             }
+        }
+
+        // Whole-session RX traffic histogram — one bounded line per
+        // RX_TRAFFIC_FLUSH_SECS so post-boot iPhone CSM activity (esp.
+        // 0x52xx) stays visible without an unbounded per-packet log.
+        // Unknown ids surface as CsmUnknownPacket(0xNNNN) names.
+        *self.rx_traffic.entry(name.to_string()).or_insert(0) += 1;
+        self.rx_traffic_total += 1;
+        if self.rx_traffic_total > 0
+            && Instant::now().saturating_duration_since(self.rx_traffic_since) >= Duration::from_secs(RX_TRAFFIC_FLUSH_SECS)
+        {
+            let summary = self
+                .rx_traffic
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            info!("RG_RX_TRAFFIC @ {:?}: {summary} ({} pkts since last flush)", since, self.rx_traffic_total);
+            self.rx_traffic.clear();
+            self.rx_traffic_total = 0;
+            self.rx_traffic_since = Instant::now();
         }
 
         if let Some(u) = packet.cast::<RouteGuidanceUpdate>() {
@@ -658,6 +788,7 @@ impl CsmSession for CarPlayServerSession {
             info!("RG_RX_IDENT_ACCEPTED @ {:?}: device accepted dongle identification", since);
             self.id_accepted = true;
             self.maybe_start_route_guidance(&_handle)?;
+            self.mark_rg_ready();
         }
 
         // if let Some(_) = packet.cast::<IdentificationAccepted>() {
@@ -704,6 +835,7 @@ impl CsmSession for CarPlayServerSession {
             // is not assumed).
             self.auth_succeeded = true;
             self.maybe_start_route_guidance(&_handle)?;
+            self.mark_rg_ready();
         }
 
         if ClientSessionHelper::handle_auth(self.mfi.clone(), &packet, _handle.clone()).await? {
