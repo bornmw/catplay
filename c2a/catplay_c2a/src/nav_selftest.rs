@@ -179,25 +179,24 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
             return Ok(());
         }
 
-        let stage = elapsed / 15; // 0: validate, 1: A, 2: B, 3: C
+        let stage = elapsed / 15; // 0: validate, 1: A/B, 2: C/D, 3: E
         match stage {
             1 => {
-                // INDEX-CHANGE PROBE, Stage A (index 0): first name, then a
-                // same-index replacement (expect NO repaint).
+                // PROBE A/B (index 0): initial render, then same-index
+                // replacement (expect the A6 to IGNORE the re-send).
                 let e = elapsed.saturating_sub(5);
                 if !stage_a {
-                    enqueue(&outbox, generation, &probe_maneuver(0, "Ext 30  3.2 km"), &mut enqueued)?;
+                    enqueue(&outbox, generation, &probe_maneuver(0, "Ext 30  5 km"), &mut enqueued)?;
                     stage_a = true;
-                    info!("RG_PROBE_A_FIRST: index=0 name='Ext 30  3.2 km'");
+                    info!("RG_PROBE_A: index=0 list=[0] 'Ext 30  5 km' (initial render)");
                 }
-                // Same-index replacement at e=5 (index 0, new name) — expect NO repaint.
                 if e == 5 {
-                    enqueue(&outbox, generation, &probe_maneuver(0, "Ext 30  2.7 km"), &mut enqueued)?;
-                    info!("RG_PROBE_A_SAME: index=0 name='Ext 30  2.7 km' (same-index replacement)");
+                    enqueue(&outbox, generation, &probe_maneuver(0, "Ext 30  4 km"), &mut enqueued)?;
+                    info!("RG_PROBE_B: index=0 list=[0] 'Ext 30  4 km' (same-index — expect ignore)");
                 }
-                let next_m = 3200u32.saturating_sub(e * 50);
-                let dest_m = 8000u32.saturating_sub(e * 50);
-                let time_s = 900u64.saturating_sub(e as u64);
+                let next_m = 5000u32.saturating_sub(e * 100);
+                let dest_m = 20000u32.saturating_sub(e * 100);
+                let time_s = 1800u64.saturating_sub(e as u64);
                 enqueue(
                     &outbox,
                     generation,
@@ -206,23 +205,21 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
                 )?;
             }
             2 => {
-                // INDEX-CHANGE PROBE, Stage B (index 1): index change (expect
-                // REPAINT if index-keyed), then a same-index replacement on
-                // index 1 (expect NO repaint).
+                // PROBE C/D (index 1): new index (expect REPAINT if
+                // index-keyed), then same new index (expect ignore).
                 let e = elapsed.saturating_sub(20);
                 if !stage_b {
-                    enqueue(&outbox, generation, &probe_maneuver(1, "Ext 30  2.2 km"), &mut enqueued)?;
+                    enqueue(&outbox, generation, &probe_maneuver(1, "Ext 30  3 km"), &mut enqueued)?;
                     stage_b = true;
-                    info!("RG_PROBE_B_CHANGE: index=1 name='Ext 30  2.2 km' (index 0->1)");
+                    info!("RG_PROBE_C: index=1 list=[1] 'Ext 30  3 km' (new index — expect repaint?)");
                 }
-                // Same-index replacement on index 1 at e=10 — expect NO repaint.
                 if e == 10 {
-                    enqueue(&outbox, generation, &probe_maneuver(1, "Elm Street"), &mut enqueued)?;
-                    info!("RG_PROBE_B_SAME: index=1 name='Elm Street' (same-index replacement)");
+                    enqueue(&outbox, generation, &probe_maneuver(1, "Ext 30  2 km"), &mut enqueued)?;
+                    info!("RG_PROBE_D: index=1 list=[1] 'Ext 30  2 km' (same new index — expect ignore)");
                 }
-                let next_m = 2200u32.saturating_sub(e * 50);
-                let dest_m = 7930u32.saturating_sub(e * 50);
-                let time_s = 886u64.saturating_sub(e as u64);
+                let next_m = 3000u32.saturating_sub(e * 100);
+                let dest_m = 15000u32.saturating_sub(e * 100);
+                let time_s = 1350u64.saturating_sub(e as u64);
                 enqueue(
                     &outbox,
                     generation,
@@ -231,21 +228,24 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
                 )?;
             }
             3 => {
-                // INDEX-CHANGE PROBE, Stage C (index 2): another index change
-                // (expect REPAINT if index-keyed).
+                // PROBE E (index 0 again): the A6 advertises storage
+                // capacity 1, so index 0 was evicted when index 1 arrived.
+                // Re-sending index 0 tests whether the car accepts a fresh
+                // definition for an evicted index (index ALTERNATION:
+                // 0,1,0,1... would then refresh without a growing counter).
                 if !stage_c {
-                    enqueue(&outbox, generation, &probe_maneuver(2, "Exit 99  1.0 km"), &mut enqueued)?;
+                    enqueue(&outbox, generation, &probe_maneuver(0, "Ext 30  1 km"), &mut enqueued)?;
                     stage_c = true;
-                    info!("RG_PROBE_C_CHANGE: index=2 name='Exit 99  1.0 km' (index 1->2)");
+                    info!("RG_PROBE_E: index=0 list=[0] 'Ext 30  1 km' (evicted index — expect repaint?)");
                 }
                 let e = elapsed.saturating_sub(45);
-                let next_m = 1000u32.saturating_sub(e * 50);
-                let dest_m = 7880u32.saturating_sub(e * 50);
-                let time_s = 881u64.saturating_sub(e as u64);
+                let next_m = 1000u32.saturating_sub(e * 100);
+                let dest_m = 10000u32.saturating_sub(e * 100);
+                let time_s = 900u64.saturating_sub(e as u64);
                 enqueue(
                     &outbox,
                     generation,
-                    &active_update(next_m, dest_m, time_s, false, 2),
+                    &active_update(next_m, dest_m, time_s, false, 0),
                     &mut enqueued,
                 )?;
             }
@@ -347,11 +347,11 @@ fn validate_caps() -> Result<(), String> {
     // INDEX-CHANGE PROBE strings — every synthetic name must fit the A6
     // after_maneuver cap (20) or the MIB3 may drop the whole 0x5202.
     for name in [
-        "Ext 30  3.2 km",
-        "Ext 30  2.7 km",
-        "Ext 30  2.2 km",
-        "Elm Street",
-        "Exit 99  1.0 km",
+        "Ext 30  5 km",
+        "Ext 30  4 km",
+        "Ext 30  3 km",
+        "Ext 30  2 km",
+        "Ext 30  1 km",
     ] {
         if name.chars().count() > A6_MAX_AFTER_MANEUVER_ROAD {
             return Err(format!("probe name '{name}' exceeds A6 cap {A6_MAX_AFTER_MANEUVER_ROAD}"));
