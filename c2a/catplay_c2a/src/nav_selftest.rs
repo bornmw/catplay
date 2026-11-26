@@ -179,64 +179,66 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
             return Ok(());
         }
 
-        let stage = elapsed / 15; // 0: validate, 1: A/B, 2: C/D, 3: E
+        let stage = elapsed / 15; // 0: validate, 1: setup, 2: alt, 3: alt
         match stage {
             1 => {
-                // PROBE A/B (index 0): initial render, then same-index
-                // replacement (expect the A6 to IGNORE the re-send).
+                // SETUP (index 0 -> 1): initial render on index 0, then a
+                // new index 1 (proven to repaint) which EVICTS index 0
+                // (A6 storage capacity = 1).
                 let e = elapsed.saturating_sub(5);
                 if !stage_a {
                     enqueue(&outbox, generation, &probe_maneuver(0, "Ext 30  5 km"), &mut enqueued)?;
                     stage_a = true;
-                    info!("RG_PROBE_A: index=0 list=[0] 'Ext 30  5 km' (initial render)");
+                    info!("RG_ALT_INIT: index=0 list=[0] 'Ext 30  5 km' (initial render)");
                 }
-                if e == 5 {
-                    enqueue(&outbox, generation, &probe_maneuver(0, "Ext 30  4 km"), &mut enqueued)?;
-                    info!("RG_PROBE_B: index=0 list=[0] 'Ext 30  4 km' (same-index — expect ignore)");
+                if e == 7 {
+                    enqueue(&outbox, generation, &probe_maneuver(1, "Ext 30  4 km"), &mut enqueued)?;
+                    info!("RG_ALT_1: index=1 list=[1] 'Ext 30  4 km' (new index — repaint, evicts 0)");
                 }
                 let next_m = 5000u32.saturating_sub(e * 100);
                 let dest_m = 20000u32.saturating_sub(e * 100);
                 let time_s = 1800u64.saturating_sub(e as u64);
+                let cur = if e >= 7 { 1 } else { 0 };
                 enqueue(
                     &outbox,
                     generation,
-                    &active_update(next_m, dest_m, time_s, false, 0),
+                    &active_update(next_m, dest_m, time_s, false, cur),
                     &mut enqueued,
                 )?;
             }
             2 => {
-                // PROBE C/D (index 1): new index (expect REPAINT if
-                // index-keyed), then same new index (expect ignore).
+                // ALTERNATION (0 -> 1): return to the EVICTED index 0, then
+                // back to the now-evicted index 1. Each return tests whether
+                // the A6 accepts a fresh definition for an evicted index.
                 let e = elapsed.saturating_sub(20);
                 if !stage_b {
-                    enqueue(&outbox, generation, &probe_maneuver(1, "Ext 30  3 km"), &mut enqueued)?;
+                    enqueue(&outbox, generation, &probe_maneuver(0, "Ext 30  3 km"), &mut enqueued)?;
                     stage_b = true;
-                    info!("RG_PROBE_C: index=1 list=[1] 'Ext 30  3 km' (new index — expect repaint?)");
+                    info!("RG_ALT_2: index=0 list=[0] 'Ext 30  3 km' (EVICTED index 0 — repaint?)");
                 }
                 if e == 10 {
                     enqueue(&outbox, generation, &probe_maneuver(1, "Ext 30  2 km"), &mut enqueued)?;
-                    info!("RG_PROBE_D: index=1 list=[1] 'Ext 30  2 km' (same new index — expect ignore)");
+                    info!("RG_ALT_3: index=1 list=[1] 'Ext 30  2 km' (EVICTED index 1 — repaint?)");
                 }
                 let next_m = 3000u32.saturating_sub(e * 100);
                 let dest_m = 15000u32.saturating_sub(e * 100);
                 let time_s = 1350u64.saturating_sub(e as u64);
+                let cur = if e >= 10 { 1 } else { 0 };
                 enqueue(
                     &outbox,
                     generation,
-                    &active_update(next_m, dest_m, time_s, false, 1),
+                    &active_update(next_m, dest_m, time_s, false, cur),
                     &mut enqueued,
                 )?;
             }
             3 => {
-                // PROBE E (index 0 again): the A6 advertises storage
-                // capacity 1, so index 0 was evicted when index 1 arrived.
-                // Re-sending index 0 tests whether the car accepts a fresh
-                // definition for an evicted index (index ALTERNATION:
-                // 0,1,0,1... would then refresh without a growing counter).
+                // ALTERNATION (-> 0): one more return to evicted index 0.
+                // Three successful returns (0,1,0,1,0) confirm index
+                // ALTERNATION works for live refresh without a counter.
                 if !stage_c {
                     enqueue(&outbox, generation, &probe_maneuver(0, "Ext 30  1 km"), &mut enqueued)?;
                     stage_c = true;
-                    info!("RG_PROBE_E: index=0 list=[0] 'Ext 30  1 km' (evicted index — expect repaint?)");
+                    info!("RG_ALT_4: index=0 list=[0] 'Ext 30  1 km' (EVICTED index 0 again — repaint?)");
                 }
                 let e = elapsed.saturating_sub(45);
                 let next_m = 1000u32.saturating_sub(e * 100);
