@@ -3,7 +3,7 @@ use std::{
     fmt,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -11,7 +11,7 @@ use std::{
 use async_trait::async_trait;
 use catplay_iap2_client::{CsmClientHandleRef, CsmFileTransferEvent, CsmSession, CsmSessionResult, tokio::ClientSessionHelper};
 use catplay_mfi::MfiDeficeRef;
-use catplay_util::mpsc;
+use catplay_util::{mpsc, spawn, AbortOnDropHandle};
 use futures::StreamExt;
 use log::{debug, info, warn};
 use macaddr::MacAddr6;
@@ -73,12 +73,15 @@ pub struct CarPlayServerSession {
     rg_ready: Arc<AtomicBool>,
 
     // Phase 1 diagnostic: whole-session RX traffic histogram (type name
-    // -> count) flushed every RX_TRAFFIC_FLUSH_SECS — captures post-boot
-    // iPhone CSM activity (esp. 0x52xx) the 15 s RG_BOOT_RX window
-    // misses, at a cost of one log line per interval.
-    rx_traffic: BTreeMap<String, u32>,
-    rx_traffic_total: u32,
-    rx_traffic_since: Instant,
+    // -> count), SHARED with an independent 30 s flush task (spawned in
+    // start()) — the flush runs on its own timer, so it fires even when
+    // the iPhone goes CSM-quiet (a flush polled in respond() would never
+    // run without incoming traffic). Unknown ids surface as
+    // CsmUnknownPacket(0xNNNN) names.
+    rx_traffic: Arc<std::sync::Mutex<BTreeMap<String, u32>>>,
+    rx_traffic_total: Arc<AtomicU32>,
+    /// Aborts the traffic-flush task when the session goes away.
+    rg_flush_task: Option<AbortOnDropHandle<()>>,
 
     events_rx: mpsc::UnboundedReceiver<CarPlayServerSessionEventRx>,
     events_tx: mpsc::UnboundedSender<CarPlayServerSessionEventTx>,
@@ -372,9 +375,9 @@ impl CarPlayServerSession {
                 rg_requested: false,
                 rg_resub,
                 rg_ready: Arc::new(AtomicBool::new(false)),
-                rx_traffic: BTreeMap::new(),
-                rx_traffic_total: 0,
-                rx_traffic_since: Instant::now(),
+                rx_traffic: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+                rx_traffic_total: Arc::new(AtomicU32::new(0)),
+                rg_flush_task: None,
             },
             events_tx0,
             events_rx1,
@@ -390,10 +393,12 @@ impl CarPlayServerSession {
     }
 
     /// Both 0x5200 preconditions are met — the resubscribe watcher task
-    /// may send.
+    /// may send (LIVE state: the task reads this Arc, never a captured
+    /// copy — ChatGPT pre-flight P0).
     fn mark_rg_ready(&self) {
-        if self.id_accepted && self.auth_succeeded {
+        if self.id_accepted && self.auth_succeeded && !self.rg_ready.load(Ordering::Relaxed) {
             self.rg_ready.store(true, Ordering::Relaxed);
+            info!("RG_RX_RESUB_READY: id_accepted=true auth_succeeded=true — 0x5200 resubscribe armed");
         }
     }
 
@@ -663,11 +668,42 @@ impl CsmSession for CarPlayServerSession {
                         destination_time_zone_offset_minutes: CsmFlag::No,
                         ev_charge_info: CsmFlag::No,
                     }) {
-                        Ok(()) => info!("RG_RX_5200_RESUB: re-sent 0x5200 route-guidance request to iPhone"),
+                        Ok(()) => info!("RG_RX_5200_RESUB: re-sent 0x5200 route-guidance request to iPhone (enqueued)"),
                         Err(err) => warn!("RG_RX_5200_RESUB: send failed: {err}"),
                     }
                 }
             });
+        }
+
+        // Phase 1 diagnostic: INDEPENDENT traffic-flush timer (ChatGPT
+        // pre-flight P0) — the histogram must flush even when the iPhone
+        // is CSM-quiet, so it cannot live in respond() (which only runs
+        // on incoming packets). One bounded line per interval; the task
+        // is aborted with the session (rg_flush_task).
+        {
+            let traffic = self.rx_traffic.clone();
+            let total = self.rx_traffic_total.clone();
+            self.rg_flush_task = Some(spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(RX_TRAFFIC_FLUSH_SECS));
+                loop {
+                    ticker.tick().await;
+                    let (summary, count) = {
+                        let map = traffic.lock().unwrap();
+                        let count = total.load(Ordering::Relaxed);
+                        let summary = map
+                            .iter()
+                            .map(|(n, c)| format!("{n}={c}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        (summary, count)
+                    };
+                    if count > 0 {
+                        info!("RG_RX_TRAFFIC: {summary} ({count} pkts since last flush)");
+                        traffic.lock().unwrap().clear();
+                        total.store(0, Ordering::Relaxed);
+                    }
+                }
+            }));
         }
         Ok(())
     }
@@ -724,26 +760,12 @@ impl CsmSession for CarPlayServerSession {
             }
         }
 
-        // Whole-session RX traffic histogram — one bounded line per
-        // RX_TRAFFIC_FLUSH_SECS so post-boot iPhone CSM activity (esp.
-        // 0x52xx) stays visible without an unbounded per-packet log.
+        // Whole-session RX traffic histogram — accumulated here, flushed
+        // by the independent timer task in start() (one bounded line per
+        // RX_TRAFFIC_FLUSH_SECS, even when the iPhone is CSM-quiet).
         // Unknown ids surface as CsmUnknownPacket(0xNNNN) names.
-        *self.rx_traffic.entry(name.to_string()).or_insert(0) += 1;
-        self.rx_traffic_total += 1;
-        if self.rx_traffic_total > 0
-            && Instant::now().saturating_duration_since(self.rx_traffic_since) >= Duration::from_secs(RX_TRAFFIC_FLUSH_SECS)
-        {
-            let summary = self
-                .rx_traffic
-                .iter()
-                .map(|(n, c)| format!("{n}={c}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            info!("RG_RX_TRAFFIC @ {:?}: {summary} ({} pkts since last flush)", since, self.rx_traffic_total);
-            self.rx_traffic.clear();
-            self.rx_traffic_total = 0;
-            self.rx_traffic_since = Instant::now();
-        }
+        *self.rx_traffic.lock().unwrap().entry(name.to_string()).or_insert(0) += 1;
+        self.rx_traffic_total.fetch_add(1, Ordering::Relaxed);
 
         if let Some(u) = packet.cast::<RouteGuidanceUpdate>() {
             info!(

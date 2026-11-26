@@ -5,7 +5,7 @@ use std::{
 };
 
 use bytes::BytesMut;
-use catplay_csm::decoder::{AsCsmPacket, CsmPacketBox, CsmPacketRegistry};
+use catplay_csm::decoder::{AsCsmPacket, CsmPacketBox, CsmPacketRegistry, CsmUnknownPacket};
 use catplay_iap2_link::{
     LinkEvent, LinkLayer, LinkStatus, PacketCoder, PacketFrame,
     files::{FileTransferEvent, FileTransferOutgoingSource, FileTransferReserved},
@@ -15,7 +15,7 @@ use catplay_lingo::{
     wire::{Frame as LingoFrame, Outgoing},
 };
 use catplay_util::{AsyncShutdown, EventReconciler, EventSleeper, deadline_maybe, mpsc, notify::Notify, oneshot};
-use log::{debug, trace, warn};
+use log::{debug, info, trace, warn};
 
 use crate::{
     CsmClient, CsmClientHandle, CsmClientHandleRef, CsmFileTransferEvent, CsmRemote, CsmSession, CsmSessionBox, CsmSessionError,
@@ -422,6 +422,22 @@ impl AsyncClient {
                     let Some(pkt) = registry.decode(&value) else {
                         return Err(CsmSessionError::ReceivedCorruptedCsmPayload);
                     };
+
+                    // Phase 1 diagnostic (CatPlay): wire-level packet-ID
+                    // visibility BEFORE typed dispatch — respond() is the
+                    // decoded entry point, this is the last raw vantage
+                    // (frames rejected by the decoder above are fatal to
+                    // the session and visible there). Bounded volume:
+                    // only route-guidance-range (0x52xx) and UNKNOWN ids
+                    // are logged per packet; everything else is tallied
+                    // by the session's RG_RX_TRAFFIC histogram.
+                    if let Some(id) = pkt.cast::<CsmUnknownPacket>().map(|u| u.id()) {
+                        if (0x5200..=0x520F).contains(&id) {
+                            info!("RG_WIRE_RX: 0x{id:04X} len={}", value.len());
+                        } else {
+                            info!("RG_WIRE_RX: unknown id 0x{id:04X} len={}", value.len());
+                        }
+                    }
 
                     #[cfg(debug_assertions)]
                     debug!("Received CSM: <- {pkt:?}");
