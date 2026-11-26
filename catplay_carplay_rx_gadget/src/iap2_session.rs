@@ -383,9 +383,11 @@ impl CarPlayServerSession {
                     StopListUpdates::PACKET_ID,
                 ][..],
             ),
-            /* Phase 1: we (device) request route-guidance updates from the
-               iPhone; the A6 also lists 0x5203 in its sent list, so both
-               directions are declared. */
+            /* Phase 1: we (device/car) send 0x5200 (start) and 0x5203
+               (stop) to the iPhone — both device->accessory, so both
+               belong in messages_sent_by_accessory. This mirrors the
+               A6's own accepted identification exactly (its sent list
+               carries 0x5200 + 0x5203). */
             (
                 true,
                 &[
@@ -422,14 +424,17 @@ impl CarPlayServerSession {
                     ListUpdate::PACKET_ID,
                 ][..],
             ),
-            /* Phase 1: the iPhone streams these to us (dongle-as-car).
-               0x5203 is the accessory-side "stop" (route ended). */
+            /* Phase 1: the iPhone (accessory) streams 0x5201/02/04 to us
+               (dongle-as-car) — accessory->device, so they belong in
+               messages_received_from_device. 0x5203 (stop) is NOT here:
+               it is device->accessory — the CAR sends it (the A6 lists it
+               in its own sent ids and we receive it from the A6 on the TX
+               side). Listing it here is what the iPhone rejected. */
             (
                 true,
                 &[
                     RouteGuidanceUpdate::PACKET_ID,
                     RouteGuidanceManeuverInformation::PACKET_ID,
-                    StopRouteGuidanceUpdates::PACKET_ID,
                     LaneGuidanceInformation::PACKET_ID,
                 ][..],
             ),
