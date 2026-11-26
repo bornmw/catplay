@@ -47,6 +47,11 @@ pub struct CarPlayServerSession {
     /// Device accepted our identification — the 0x5200 route-guidance
     /// request is only sent after this (mirrors the A6's bootstrap order).
     id_accepted: bool,
+    /// Device authentication completed.
+    auth_succeeded: bool,
+    /// The 0x5200 route-guidance request was sent exactly once
+    /// (idempotent across the identification/auth callback order).
+    rg_requested: bool,
 
     events_rx: mpsc::UnboundedReceiver<CarPlayServerSessionEventRx>,
     events_tx: mpsc::UnboundedSender<CarPlayServerSessionEventTx>,
@@ -297,6 +302,8 @@ impl CarPlayServerSession {
                 boot_rx_done: false,
                 rg_sink,
                 id_accepted: false,
+                auth_succeeded: false,
+                rg_requested: false,
             },
             events_tx0,
             events_rx1,
@@ -309,6 +316,32 @@ impl CarPlayServerSession {
         if let Some(sink) = &self.rg_sink {
             sink.push(RouteGuidanceEvent::Disconnected);
         }
+    }
+
+    /// Phase 1: send the 0x5200 route-guidance request to the iPhone —
+    /// exactly once, and only after BOTH identification was accepted
+    /// and authentication succeeded (call order between the two
+    /// callbacks is not assumed). Declares our display component and
+    /// supports_exit_info (without it the iPhone never populates
+    /// 0x5202.exit_info).
+    fn maybe_start_route_guidance(&mut self, handle: &CsmClientHandleRef) -> CsmSessionResult<()> {
+        if !self.id_accepted || !self.auth_succeeded || self.rg_requested {
+            return Ok(());
+        }
+        handle.send(&StartRouteGuidanceUpdates {
+            route_guidance_display_component_id: vec![RG_COMPONENT_ID],
+            source_name: CsmFlag::Yes,
+            source_supports_route_guidance: CsmFlag::Yes,
+            supports_exit_info: CsmFlag::Yes,
+            destination_time_zone_offset_minutes: CsmFlag::No,
+            ev_charge_info: CsmFlag::No,
+        })?;
+        self.rg_requested = true;
+        info!(
+            "RG_RX_5200_SENT @ {:?}: requested route guidance updates from iPhone (component {RG_COMPONENT_ID}, exit_info=Yes)",
+            Instant::now() - self.start
+        );
+        Ok(())
     }
 
     pub fn id(identity: &CarPlaySessionIdentity) -> IdentificationInformation {
@@ -619,6 +652,7 @@ impl CsmSession for CarPlayServerSession {
         if packet.cast::<IdentificationAccepted>().is_some() {
             info!("RG_RX_IDENT_ACCEPTED @ {:?}: device accepted dongle identification", since);
             self.id_accepted = true;
+            self.maybe_start_route_guidance(&_handle)?;
         }
 
         // if let Some(_) = packet.cast::<IdentificationAccepted>() {
@@ -659,22 +693,12 @@ impl CsmSession for CarPlayServerSession {
                 _handle.send(&StartNowPlayingUpdates::all())?;
             }
 
-            // Phase 1: ask the iPhone to stream route guidance, declaring
-            // our display component and — critically — supports_exit_info
-            // (without it the iPhone never populates 0x5202.exit_info).
-            // Only after identification was accepted (bootstrap parity
-            // with the A6: id accepted -> auth -> 0x5200).
-            if self.id_accepted {
-                _handle.send(&StartRouteGuidanceUpdates {
-                    route_guidance_display_component_id: vec![RG_COMPONENT_ID],
-                    source_name: CsmFlag::Yes,
-                    source_supports_route_guidance: CsmFlag::Yes,
-                    supports_exit_info: CsmFlag::Yes,
-                    destination_time_zone_offset_minutes: CsmFlag::No,
-                    ev_charge_info: CsmFlag::No,
-                })?;
-                info!("RG_RX_5200_SENT @ {:?}: requested route guidance updates (component {RG_COMPONENT_ID}, exit_info=Yes)", since);
-            }
+            // Phase 1: ask the iPhone to stream route guidance (sent
+            // exactly once via maybe_start_route_guidance, which requires
+            // id_accepted as well — the call order of the two callbacks
+            // is not assumed).
+            self.auth_succeeded = true;
+            self.maybe_start_route_guidance(&_handle)?;
         }
 
         if ClientSessionHelper::handle_auth(self.mfi.clone(), &packet, _handle.clone()).await? {

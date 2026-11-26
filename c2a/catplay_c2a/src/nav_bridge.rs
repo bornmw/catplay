@@ -10,18 +10,27 @@
 //! field the A6 HUD renders. The distance refreshes on a 5 s cadence
 //! (and immediately when a new 0x5202 arrives, per the protocol review).
 //!
-//! Invariants (per the ChatGPT-approved plan):
+//! Invariants (per the ChatGPT-approved plan + pre-flash review fixes):
 //! - Transform 0x5202 at forward time, not only on the 5 s tick.
+//! - Order-2 safe: a 0x5202 that arrives BEFORE the 0x5201 making its
+//!   index current is cached and emitted immediately when that 0x5201
+//!   arrives (`last_sent_index` tracking).
 //! - A combo is only attached when the distance sample MATCHES the
-//!   maneuver (same index, same route epoch, < 3 s old) — a previous
-//!   maneuver's distance is never attached to a new exit.
+//!   maneuver (same index, same route epoch, < 3 s old). A redefinition
+//!   of the current maneuver (same-index reroute) invalidates the
+//!   sample until the next 0x5201 reconfirms it.
+//! - Only the CURRENT maneuver index is forwarded to the A6 (its
+//!   maneuver storage is 1); upcoming indexes are cached.
 //! - 0x5203 is NEVER forwarded toward the A6 (accessory-originated);
-//!   the clean stop is an inactive 0x5201 (proven in the M1 self-test).
+//!   route end => clean-stop inactive 0x5201 (proven in the M1 self-test).
 //! - RX and TX component ids are mapped by explicit constants, not by
 //!   assuming equality.
 //! - Every forwarded packet is enforced against the A6's advertised
 //!   caps (current_road 6, destination 6, after_maneuver 20,
 //!   lane_desc 0 -> omit).
+//! - A TX session boundary (outbox generation change) drops only the
+//!   TX-side send markers; the RX route state survives and is replayed
+//!   by the readiness-gate flush when the A6 re-subscribes.
 //!
 //! TX readiness gate: nothing is forwarded until the outbox reports a
 //! live handle AND the A6's 0x5200 subscription; the latest bounded
@@ -79,10 +88,16 @@ struct Guidance {
     last_update: Option<RouteGuidanceUpdate>,
     distance: Option<DistanceSample>,
     maneuvers: BTreeMap<u16, RouteGuidanceManeuverInformation>,
-    /// Last combo text sent to the A6 (change detection: an unchanged
-    /// combo is not re-sent — repeated 0x5202 repaints are the flicker
-    /// risk we are not allowed to take).
-    last_combo: Option<String>,
+    /// Last combo text sent to the A6, scoped to the route epoch that
+    /// produced it (change detection: an unchanged combo is not
+    /// re-sent — repeated 0x5202 repaints are the flicker risk we are
+    /// not allowed to take). A new epoch (new route) always re-sends.
+    last_combo: Option<(u32, String)>,
+    /// Last maneuver index whose 0x5202 the A6 actually received.
+    /// Drives the Order-2 re-emit: when a 0x5201 makes an index current
+    /// that the A6 has not received yet, the cached 0x5202 is emitted
+    /// immediately (maneuver-before-distance arrival order).
+    last_sent_index: Option<u16>,
 
     last_tx_gen: u32,
     tx_ready: bool,
@@ -97,6 +112,7 @@ impl Guidance {
             distance: None,
             maneuvers: BTreeMap::new(),
             last_combo: None,
+            last_sent_index: None,
             last_tx_gen: 0,
             tx_ready: false,
         }
@@ -126,16 +142,25 @@ impl Guidance {
         self.distance = None;
         self.maneuvers.clear();
         self.last_combo = None;
+        self.last_sent_index = None;
     }
 
-    /// Outbox generation tracking + TX readiness gate. A generation
-    /// change is a session boundary: all route state is dropped (the
-    /// new iAP2 pipe starts a new CarPlay session on both sides).
+    /// Outbox generation tracking + TX readiness gate.
+    ///
+    /// A generation change is a TX session boundary (the A6's iAP2 pipe
+    /// was replaced) — but the iPhone stream (RX side) is INDEPENDENT
+    /// and still alive: the RX route state (maneuver cache, distance
+    /// sample, active flag, epoch) is PRESERVED. Only the TX-side send
+    /// markers are dropped; when the new A6 session re-subscribes,
+    /// `flush_held` replays the current state (per pre-flash review:
+    /// clearing the RX cache here left a reconnected A6 with distances
+    /// but no HUD text until a brand-new 0x5202 arrived).
     fn sync_tx(&mut self, outbox: &NavOutbox) {
         let (handle, generation, subscribed) = outbox.snapshot();
         if generation != self.last_tx_gen {
             self.last_tx_gen = generation;
-            self.clear();
+            self.last_combo = None;
+            self.last_sent_index = None;
             self.tx_ready = false;
             return;
         }
@@ -155,13 +180,35 @@ impl Guidance {
             let _ = outbox.send_if_current(self.last_tx_gen, &out);
         }
         if let Some(index) = self.current_index() {
-            if let Some(m) = self.maneuvers.get(&index) {
-                let out = match self.fresh_distance(index) {
-                    Some(d) if m.exit_info.is_some() => transform_maneuver(m, d.meters),
-                    _ => plain_maneuver(m),
-                };
-                let _ = outbox.send_if_current(self.last_tx_gen, &out);
+            if let Some(m) = self.maneuvers.get(&index).cloned() {
+                self.emit_maneuver(&m, outbox);
             }
+        }
+    }
+
+    /// Forward a (current) 0x5202 to the A6: combo-transformed when a
+    /// matching fresh distance sample exists, plain otherwise. Updates
+    /// the TX-side markers (`last_sent_index`, epoch-scoped
+    /// `last_combo`) only on a generation-validated enqueue.
+    fn emit_maneuver(&mut self, m: &RouteGuidanceManeuverInformation, outbox: &NavOutbox) {
+        self.maneuvers.insert(m.index, m.clone());
+
+        let out = match (m.exit_info.as_deref(), self.fresh_distance(m.index)) {
+            (Some(_), Some(d)) => transform_maneuver(m, d.meters),
+            _ => plain_maneuver(m),
+        };
+        match outbox.send_if_current(self.last_tx_gen, &out) {
+            Ok(()) => {
+                self.last_sent_index = Some(m.index);
+                debug!("RG_FWD_5202: index={} after={:?}", m.index, out.after_maneuver_road_name);
+                if out.after_maneuver_road_name != m.after_maneuver_road_name {
+                    if let Some(text) = &out.after_maneuver_road_name {
+                        self.last_combo = Some((self.epoch, text.clone()));
+                        info!("RG_COMBO_SENT: '{text}' (transform at forward) index={}", m.index);
+                    }
+                }
+            }
+            Err(e) => debug!("RG_FWD_5202 failed: {e}"),
         }
     }
 
@@ -216,12 +263,34 @@ impl Guidance {
         }
         let out = enforce_update_caps(&u);
         match outbox.send_if_current(self.last_tx_gen, &out) {
-            Ok(()) => debug!(
-                "RG_FWD_5201: state={:?} next_m={:?}",
-                u.route_guidance_state,
-                out.distance_remaining_to_next_maneuver
-            ),
+            Ok(()) => {
+                // The full current list is logged (first element is the
+                // HUD's next maneuver for a storage-1 device — verified
+                // against the A6, not assumed).
+                debug!(
+                    "RG_FWD_5201: state={:?} current_list={:?} picked={:?} next_m={:?}",
+                    u.route_guidance_state,
+                    u.route_guidance_maneuver_current_list,
+                    self.current_index(),
+                    out.distance_remaining_to_next_maneuver
+                );
+            }
             Err(e) => debug!("RG_FWD_5201 failed: {e}"),
+        }
+
+        // Order-2 fix (pre-flash review P0): a 0x5202 may have arrived
+        // BEFORE the 0x5201 that makes its index current (maneuver-
+        // before-distance). It was cached, not forwarded. If this 0x5201
+        // makes a cached index current that the A6 has not received,
+        // emit it now — with the combo when the just-sampled distance
+        // matches.
+        if let Some(index) = self.current_index()
+            && self.last_sent_index != Some(index)
+            && self.maneuvers.contains_key(&index)
+        {
+            if let Some(m) = self.maneuvers.get(&index).cloned() {
+                self.emit_maneuver(&m, outbox);
+            }
         }
     }
 
@@ -229,37 +298,27 @@ impl Guidance {
         self.sync_tx(outbox);
         check_rx_component_id("0x5202", m.route_guidance_display_component_id);
 
-        let is_current = self.current_index() == Some(m.index);
-        self.maneuvers.insert(m.index, m.clone());
-        if is_current {
-            info!("RG_ACTIVE_MANEUVER: index={} exit_info={:?}", m.index, m.exit_info);
-        }
-        if !self.tx_ready {
-            return; // held until the gate opens
+        // A REDEFINITION of the current maneuver (same index re-sent —
+        // e.g. a same-index reroute without an inactive transition)
+        // makes the distance association uncertain: drop the sample;
+        // the next 0x5201 (<= 1 s) reconfirms it, and the 5 s tick
+        // resumes the combo. A first store for the index keeps the
+        // sample (the index-match rule already guards it). Applied
+        // before the tx_ready gate so it holds even while the gate is
+        // closed.
+        if self.maneuvers.contains_key(&m.index) && self.current_index() == Some(m.index) {
+            self.distance = None;
         }
 
-        // Transform at forward time (review fix #1): a matching fresh
-        // distance attaches the combo NOW — the user does not wait for
-        // the next 5 s tick after a maneuver change.
-        let out = match (m.exit_info.as_deref(), self.fresh_distance(m.index)) {
-            (Some(_), Some(d)) => transform_maneuver(&m, d.meters),
-            _ => plain_maneuver(&m),
-        };
-        match outbox.send_if_current(self.last_tx_gen, &out) {
-            Ok(()) => {
-                debug!(
-                    "RG_FWD_5202: index={} after={:?}",
-                    m.index, out.after_maneuver_road_name
-                );
-                if out.after_maneuver_road_name != m.after_maneuver_road_name {
-                    if let Some(text) = &out.after_maneuver_road_name {
-                        self.last_combo = Some(text.clone());
-                        info!("RG_COMBO_SENT: '{text}' (transform at forward)");
-                    }
-                }
-            }
-            Err(e) => debug!("RG_FWD_5202 failed: {e}"),
+        // The A6 stores ONE maneuver (storage capacity 1): forward only
+        // the CURRENT index; upcoming indexes are cached and emitted when
+        // a 0x5201 makes them current (Order-2 re-emit above).
+        if !self.tx_ready || self.current_index() != Some(m.index) {
+            self.maneuvers.insert(m.index, m);
+            return;
         }
+        info!("RG_ACTIVE_MANEUVER: index={} exit_info={:?}", m.index, m.exit_info);
+        self.emit_maneuver(&m, outbox);
     }
 
     fn on_lanes(&mut self, l: LaneGuidanceInformation, outbox: &NavOutbox) {
@@ -316,14 +375,16 @@ impl Guidance {
         let Some(text) = format_combo(exit, d.meters) else {
             return;
         };
-        if self.last_combo.as_deref() == Some(text.as_str()) {
+        // Epoch-scoped change detection: a combo from a previous route
+        // (different epoch) never suppresses this one.
+        if self.last_combo.as_ref().filter(|(e, _)| *e == self.epoch).map(|(_, t)| t.as_str()) == Some(text.as_str()) {
             return;
         }
         let out = transform_maneuver(m, d.meters);
         match outbox.send_if_current(self.last_tx_gen, &out) {
             Ok(()) => {
-                self.last_combo = Some(text.clone());
-                info!("RG_COMBO_SENT: '{text}' (5 s refresh)");
+                self.last_combo = Some((self.epoch, text.clone()));
+                info!("RG_COMBO_SENT: '{text}' (5 s refresh) index={index}");
             }
             Err(e) => debug!("RG_TICK_5202 failed: {e}"),
         }
@@ -529,5 +590,72 @@ mod tests {
         let name = out.after_maneuver_road_name.as_deref().unwrap();
         assert!(name.chars().count() <= A6_MAX_AFTER_MANEUVER);
         assert_eq!(name, "A Very Long Street N");
+    }
+
+    #[test]
+    fn non_current_maneuver_is_cached_only() {
+        let mut g = Guidance::new();
+        g.active = true;
+        g.epoch = 1;
+        g.last_update = Some(RouteGuidanceUpdate {
+            route_guidance_display_component_id: vec![RX_COMPONENT_ID],
+            route_guidance_maneuver_current_list: Some(catplay_csm::decoder::CsmPacked::from(vec![0u16])),
+            ..Default::default()
+        });
+        let outbox = NavOutbox::new(); // no handle: sends fail, state still transitions
+        let m = RouteGuidanceManeuverInformation {
+            route_guidance_display_component_id: RX_COMPONENT_ID,
+            index: 5, // upcoming, not current
+            ..Default::default()
+        };
+        g.on_maneuver(m, &outbox);
+        // Cached for the Order-2 re-emit; the A6 (storage 1) never sees
+        // a non-current index.
+        assert!(g.maneuvers.contains_key(&5));
+        assert_ne!(g.last_sent_index, Some(5));
+    }
+
+    #[test]
+    fn redefined_current_maneuver_invalidates_distance() {
+        let mut g = Guidance::new();
+        g.active = true;
+        g.epoch = 1;
+        g.last_update = Some(RouteGuidanceUpdate {
+            route_guidance_display_component_id: vec![RX_COMPONENT_ID],
+            route_guidance_maneuver_current_list: Some(catplay_csm::decoder::CsmPacked::from(vec![0u16])),
+            ..Default::default()
+        });
+        g.distance = Some(DistanceSample {
+            meters: 3200,
+            maneuver_index: 0,
+            epoch: 1,
+            at: Instant::now(),
+        });
+
+        let outbox = NavOutbox::new(); // no handle: sends fail, state still transitions
+
+        // First store of the current index: the matching sample survives.
+        let m1 = RouteGuidanceManeuverInformation {
+            route_guidance_display_component_id: RX_COMPONENT_ID,
+            index: 0,
+            after_maneuver_road_name: Some("Route A Street".into()),
+            exit_info: Some("Exit 30".into()),
+            ..Default::default()
+        };
+        g.on_maneuver(m1, &outbox);
+        assert!(g.fresh_distance(0).is_some());
+
+        // Same-index redefinition (reroute without an inactive
+        // transition): the distance association is now uncertain — the
+        // sample is dropped until the next 0x5201 reconfirms it.
+        let m2 = RouteGuidanceManeuverInformation {
+            route_guidance_display_component_id: RX_COMPONENT_ID,
+            index: 0,
+            after_maneuver_road_name: Some("Route B Street".into()),
+            exit_info: Some("Exit 12".into()),
+            ..Default::default()
+        };
+        g.on_maneuver(m2, &outbox);
+        assert!(g.fresh_distance(0).is_none());
     }
 }
