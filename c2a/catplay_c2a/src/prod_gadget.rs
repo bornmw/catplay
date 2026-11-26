@@ -8,7 +8,10 @@ use catplay_carplay::{
     carplay_rx::sink::AirPlayServerShared,
     carplay_tx::{AirPlayTransmitterImpl, AirPlayTransmitterSessionError, TeardownGuard},
 };
-use catplay_carplay_rx_gadget::{CarPlayWirelessGadget, CarPlayWirelessGadgetError, CarPlayWirelessGadgetState};
+use catplay_carplay_rx_gadget::{
+    CarPlayWirelessGadget, CarPlayWirelessGadgetError, CarPlayWirelessGadgetState, RouteGuidanceEvent,
+    RouteGuidanceSink,
+};
 use catplay_carplay_tx_gadget::client::{CarPlayUsbClientGadget, CarPlayUsbClientGadgetError, CarPlayUsbClientGadgetStatus};
 use catplay_carplay_tx_gadget::nav_outbox::NavOutbox;
 use catplay_hap::HomekitStorageRef;
@@ -205,6 +208,11 @@ impl Reconcilable for ProdGadget {
 
         let shared = AirPlayServerShared::new();
 
+        // Phase 1: route-guidance bridge channel — the RX session
+        // (dongle-as-car) publishes iPhone 0x52xx events here; the c2a
+        // bridge task (spawned below with the TX outbox) consumes them.
+        let (rg_tx, rg_rx) = mpsc::unbounded::<RouteGuidanceEvent>();
+
         if self.rx.is_none() {
             self.rx.replace(CarPlayWirelessGadget::new(
                 self.cfg.homekit_rx.clone(),
@@ -218,6 +226,7 @@ impl Reconcilable for ProdGadget {
                 self.cfg.wpa,
                 self.cfg.channel,
                 Some(&self.cfg.bt_cache_file),
+                Some(RouteGuidanceSink::new(rg_tx)),
                 {
                     let car = self.last_tx.clone();
 
@@ -248,7 +257,9 @@ impl Reconcilable for ProdGadget {
             self.tx.replace(gadget);
             // SSH-triggerable route-guidance self-test (off until
             // `/run/catplay/navtest.cmd` says start).
-            crate::nav_selftest::spawn(nav_outbox);
+            crate::nav_selftest::spawn(nav_outbox.clone());
+            // Phase 1: live route-guidance bridge (iPhone -> A6, HUD combo).
+            crate::nav_bridge::spawn(rg_rx, nav_outbox);
         }
         let mut pending_transmitter = self.pending_transmitter.lock().await;
 

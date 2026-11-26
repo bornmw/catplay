@@ -18,7 +18,7 @@ use catplay_util::{
 use log::{debug, error, info, trace, warn};
 use macaddr::MacAddr6;
 
-use crate::{CarPlayServerSession, CarPlaySessionIdentity};
+use crate::{CarPlayServerSession, CarPlaySessionIdentity, RouteGuidanceSink};
 
 /// CarPlay HeadUnit (Wireless)
 pub struct CarPlayWirelessGadget<T: AirPlayReceiverSink> {
@@ -47,6 +47,9 @@ pub struct CarPlayWirelessGadget<T: AirPlayReceiverSink> {
     // AirPlay sink
     sink: Arc<dyn Fn() -> T + Send + Sync + 'static>,
 
+    // Phase 1: route-guidance bridge feed for the c2a nav bridge.
+    rg_sink: Option<RouteGuidanceSink>,
+
     invites_blocked: bool,
     last_mac: Option<MacAddr6>,
 
@@ -72,6 +75,8 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
         channel: Option<u8>,
 
         bt_last_connect_cache_file: Option<&str>,
+        // Phase 1: route-guidance bridge feed (None = bridge not wired).
+        rg_sink: Option<RouteGuidanceSink>,
         sink: impl Fn() -> T + Send + Sync + 'static,
     ) -> Reconciler<Self> {
         Reconciler::new(
@@ -93,6 +98,7 @@ impl<T: AirPlayReceiverSink> CarPlayWirelessGadget<T> {
                 mfi,
                 shared,
                 sink: Arc::new(sink),
+                rg_sink,
                 invites_blocked: false,
                 last_mac: None,
                 bt_last_connect_cache_file: bt_last_connect_cache_file.map(|p| p.into()),
@@ -330,6 +336,7 @@ impl<T: AirPlayReceiverSink> Reconcilable for CarPlayWirelessGadget<T> {
             }
             LocalState::StartingBluetooth { hci, mac } => {
                 let mfi = self.mfi.clone();
+                let rg_sink = self.rg_sink.clone();
                 let identity = CarPlaySessionIdentity {
                     display_name: self.name.clone(),
                     ncm_iface: None,
@@ -344,7 +351,7 @@ impl<T: AirPlayReceiverSink> Reconcilable for CarPlayWirelessGadget<T> {
                     ..CarPlaySessionIdentity::default()
                 };
 
-                let cb = move || CarPlayServerSession::new(mfi.clone(), identity.clone()).0;
+                let cb = move || CarPlayServerSession::new(mfi.clone(), identity.clone(), rg_sink.clone()).0;
                 let mut mgr = BluetoothManager::new(false, true, true, hci, cb);
                 mgr.start()
                     .await

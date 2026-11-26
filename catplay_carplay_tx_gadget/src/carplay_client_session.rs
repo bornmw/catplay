@@ -796,6 +796,16 @@ impl CsmSession for CarPlayClientSession {
             );
         }
 
+        // Phase 1: the A6 lists 0x5203 in its sent ids — it may stop the
+        // subscription on its side (route guidance display dismissed).
+        // The bridge closes its TX gate until a fresh 0x5200 arrives.
+        if packet.cast::<StopRouteGuidanceUpdates>().is_some() {
+            if let Some(pub_gen) = self.published_generation {
+                self.nav_outbox.mark_route_unsubscribed(pub_gen);
+            }
+            info!("RG_RX_STOP_5203: car stopped route guidance updates (TX gate closed)");
+        }
+
         if let Some(_id) = IdentificationInformation::cast(&packet) {
             self.id = _id.clone();
             // Route-guidance capability audit (M1): makes the car's declared

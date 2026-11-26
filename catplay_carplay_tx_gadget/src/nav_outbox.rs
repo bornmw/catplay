@@ -76,6 +76,17 @@ impl NavOutbox {
         }
     }
 
+    /// Record that the car stopped the route-guidance subscription
+    /// (A6-originated 0x5203 — it lists 0x5203 in its sent ids). The
+    /// bridge closes its TX gate until the car re-subscribes with 0x5200.
+    /// No-op if the session has already been superseded.
+    pub fn mark_route_unsubscribed(&self, generation: u32) {
+        let mut s = self.state.lock().unwrap();
+        if s.generation == generation {
+            s.route_subscribed = false;
+        }
+    }
+
     /// Consistent snapshot of `(handle, generation, route_subscribed)`.
     pub fn snapshot(&self) -> (Option<CsmClientHandleRef>, u32, bool) {
         let s = self.state.lock().unwrap();

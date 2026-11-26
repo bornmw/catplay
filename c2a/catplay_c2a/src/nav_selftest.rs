@@ -14,8 +14,8 @@
 //! | t (s) | stage    | what is sent |
 //! |-------|----------|--------------|
 //! | 0–5   | validate | active TX session + stable generation required |
-//! | 5–20  | A        | one 0x5202 (left turn, "Elm Street") + active 0x5201 @ 1 Hz, 500 m held |
-//! | 20–45 | B        | 0x5201 @ 1 Hz, distances decreasing at 5 m/s |
+//! | 5–20  | A        | 0x5202 highway exit ("I-87 North", exit_info "Exit 30", 3200 m) + active 0x5201 @ 1 Hz; HUD combo (`nav_combo`) re-sent as 0x5202 at 5 s cadence with decreasing distance ("Ext 30  3.0 km" → "Ext 30  2.7 km") |
+//! | 20–45 | B        | 0x5202 urban ("Elm Street", NO exit_info) — street name must stay; 0x5201 @ 1 Hz, distances decreasing at 5 m/s |
 //! | 45–60 | C        | 0x5202 with exit angle −90 + 0x5204 three-lane block, 0x5201 continues |
 //! | 60    | stop     | inactive 0x5201 (`NoRouteSet`) — never 0x5203 (accessory-originated) |
 //!
@@ -145,6 +145,7 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
 
     let t0 = Instant::now();
     let mut stage_a = false;
+    let mut stage_b = false;
     let mut stage_c = false;
     let mut enqueued = 0u32;
     let mut ticker = tokio::time::interval(TICK);
@@ -166,7 +167,7 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
                 Err(_) => info!("RG_TEST_STOP: {reason} — session gone, cleanup skipped"),
             }
             info!(
-                "RG_TEST_DONE: gen={generation} stage_a={stage_a} stage_c={stage_c} packets_enqueued={enqueued}"
+                "RG_TEST_DONE: gen={generation} stage_a={stage_a} stage_b={stage_b} stage_c={stage_c} packets_enqueued={enqueued}"
             );
             return Ok(());
         }
@@ -181,16 +182,39 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
         let stage = elapsed / 15; // 0: validate, 1: A, 2: B, 3: C
         match stage {
             1 => {
+                // Highway exit stage: the HUD combo (production
+                // `nav_combo` format) replaces the street name and
+                // refreshes on a 5 s cadence with decreasing distance.
+                let e = elapsed.saturating_sub(5);
                 if !stage_a {
-                    enqueue(&outbox, generation, &maneuver(false), &mut enqueued)?;
+                    enqueue(&outbox, generation, &maneuver_highway(), &mut enqueued)?;
                     stage_a = true;
-                    info!("RG_TEST_STAGE_A: 0x5202 enqueued (left turn, 'Elm Street')");
+                    info!("RG_TEST_STAGE_A: 0x5202 highway exit ('I-87 North', exit_info 'Exit 30', 3200 m)");
                 }
-                enqueue(&outbox, generation, &active_update(500, 8000, 900, false), &mut enqueued)?;
+                // 50 m/s synthetic approach; combo ticks at e=5 and e=10.
+                let next_m = 3200u32.saturating_sub(e * 50);
+                if e > 0 && e % 5 == 0 {
+                    match crate::nav_combo::format_combo("Exit 30", next_m) {
+                        Some(combo) => {
+                            enqueue(&outbox, generation, &maneuver_combo(combo.clone()), &mut enqueued)?;
+                            info!("RG_TEST_COMBO: '{combo}' (meters={next_m})");
+                        }
+                        None => warn!("RG_TEST_COMBO: combo does not fit at {next_m} m — skipped"),
+                    }
+                }
+                let dest_m = 8000u32.saturating_sub(e * 50);
+                let time_s = 900u64.saturating_sub(e as u64);
+                enqueue(&outbox, generation, &active_update(next_m, dest_m, time_s, false), &mut enqueued)?;
             }
             2 => {
+                // Urban stage: NO exit_info — the street name must stay.
                 let e = elapsed.saturating_sub(20);
-                // 5 m/s: at e=24 (last B tick) next=380, dest=7680, time=876
+                if !stage_b {
+                    enqueue(&outbox, generation, &maneuver(false), &mut enqueued)?;
+                    stage_b = true;
+                    info!("RG_TEST_STAGE_B: 0x5202 urban ('Elm Street', no exit_info)");
+                }
+                // 5 m/s: at e=14 (last B tick) next=380, dest=7930, time=886
                 let next_m = 500u32.saturating_sub(e * 5);
                 let dest_m = 8000u32.saturating_sub(e * 5);
                 let time_s = 900u64.saturating_sub(e as u64);
@@ -206,8 +230,8 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
                 let e = elapsed.saturating_sub(45);
                 // Continues from B's last tick (next=380).
                 let next_m = 380u32.saturating_sub(e * 5);
-                let dest_m = 7680u32.saturating_sub(e * 5);
-                let time_s = 876u64.saturating_sub(e as u64);
+                let dest_m = 7930u32.saturating_sub(e * 5);
+                let time_s = 886u64.saturating_sub(e as u64);
                 enqueue(&outbox, generation, &active_update(next_m, dest_m, time_s, true), &mut enqueued)?;
             }
             _ => {} // 0–5 s: validate, quiet
@@ -269,20 +293,32 @@ fn validate_caps() -> Result<(), String> {
     if inactive.current_road_name.is_some() || inactive.destination_name.is_some() {
         return Err("inactive 0x5201 must carry no road/destination names".into());
     }
-    // 0x5202 — both stage variants (plain + exit angle).
+    // 0x5202 — all stage variants (highway raw, combo refreshes, urban).
     for exit_angle in [false, true] {
         let m = maneuver(exit_angle);
-        if let Some(s) = &m.after_maneuver_road_name {
-            if s.chars().count() > A6_MAX_AFTER_MANEUVER_ROAD {
-                return Err(format!("after_maneuver_road_name '{s}' exceeds A6 cap {A6_MAX_AFTER_MANEUVER_ROAD}"));
-            }
-        }
+        check_maneuver_caps(&m)?;
         // A6 caps maneuver_description at 0: the field must be absent.
         if m.maneuver_description.is_some() {
             return Err("maneuver_description set although A6 cap is 0".into());
         }
         if m.index != MANEUVER_INDEX {
             return Err(format!("0x5202 index {} != MANEUVER_INDEX", m.index));
+        }
+    }
+    let highway = maneuver_highway();
+    check_maneuver_caps(&highway)?;
+    if highway.index != MANEUVER_INDEX {
+        return Err(format!("0x5202 index {} != MANEUVER_INDEX", highway.index));
+    }
+    // The production combo strings for the exact Stage A timeline values
+    // must exist and fit the A6 cap (nav_combo guarantees the fit, but
+    // verify the real numbers end-to-end).
+    for e in [5u32, 10] {
+        let meters = 3200u32.saturating_sub(e * 50);
+        match crate::nav_combo::format_combo("Exit 30", meters) {
+            Some(combo) if combo.chars().count() <= A6_MAX_AFTER_MANEUVER_ROAD => {}
+            Some(combo) => return Err(format!("combo '{combo}' ({meters} m) exceeds A6 cap {A6_MAX_AFTER_MANEUVER_ROAD}")),
+            None => return Err(format!("combo does not fit at {meters} m — Stage A would lose the exit")),
         }
     }
     // 0x5204 — A6 caps lane description at 0: the field must be absent.
@@ -292,6 +328,16 @@ fn validate_caps() -> Result<(), String> {
     }
     if l.lane_guidance_index != 0 {
         return Err(format!("0x5204 index {} != 0 (0x5201 references 0)", l.lane_guidance_index));
+    }
+    Ok(())
+}
+
+/// Shared 0x5202 cap check (after_maneuver_road_name <= 20).
+fn check_maneuver_caps(m: &RouteGuidanceManeuverInformation) -> Result<(), String> {
+    if let Some(s) = &m.after_maneuver_road_name {
+        if s.chars().count() > A6_MAX_AFTER_MANEUVER_ROAD {
+            return Err(format!("after_maneuver_road_name '{s}' exceeds A6 cap {A6_MAX_AFTER_MANEUVER_ROAD}"));
+        }
     }
     Ok(())
 }
@@ -341,10 +387,9 @@ fn inactive_update() -> RouteGuidanceUpdate {
     }
 }
 
-/// Maneuver, 0x5202. Stage C adds the exit angle (−90 = left).
-/// `exit_info` exercises the A6's native exit-label rendering (it
-/// advertises supports_exit_info: Yes) — treated as an opaque,
-/// pre-formatted label, exactly as a real iPhone sends it.
+/// Urban maneuver, 0x5202 (Stages B/C): street name, NO exit_info —
+/// the HUD must keep showing the street name. Stage C adds the exit
+/// angle (−90 = left).
 fn maneuver(exit_angle: bool) -> RouteGuidanceManeuverInformation {
     RouteGuidanceManeuverInformation {
         route_guidance_display_component_id: COMPONENT_ID,
@@ -357,8 +402,35 @@ fn maneuver(exit_angle: bool) -> RouteGuidanceManeuverInformation {
         driving_side: Some(DrivingSide::RightOrAntiClockwiseForRoundabouts),
         junction_type: Some(JunctionType::Value0),
         junction_element_exit_angle: exit_angle.then_some(-90),
-        exit_info: Some("Exit 12A".into()),
         ..Default::default()
+    }
+}
+
+/// Highway maneuver, 0x5202 (Stage A start): what a real iPhone sends —
+/// exit_info as an opaque pre-formatted label, street name intact. The
+/// combo replaces the street name on the follow-up refreshes.
+fn maneuver_highway() -> RouteGuidanceManeuverInformation {
+    RouteGuidanceManeuverInformation {
+        route_guidance_display_component_id: COMPONENT_ID,
+        index: MANEUVER_INDEX,
+        maneuver_type: Some(ManeuverType::LeftTurnAngleIsBetween45And135Degrees),
+        after_maneuver_road_name: Some("I-87 North".into()),
+        distance_between_maneuver: Some(3200),
+        distance_between_maneuver_display_string: Some("3.2".into()),
+        distance_between_maneuver_display_units: Some(DistanceDisplayUnits::Km),
+        driving_side: Some(DrivingSide::RightOrAntiClockwiseForRoundabouts),
+        junction_type: Some(JunctionType::Value0),
+        exit_info: Some("Exit 30".into()),
+        ..Default::default()
+    }
+}
+
+/// Highway maneuver with the HUD combo in after_maneuver_road_name
+/// (Stage A 5 s refreshes) — the production `nav_combo` format.
+fn maneuver_combo(combo: String) -> RouteGuidanceManeuverInformation {
+    RouteGuidanceManeuverInformation {
+        after_maneuver_road_name: Some(combo),
+        ..maneuver_highway()
     }
 }
 

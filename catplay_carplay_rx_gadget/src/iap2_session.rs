@@ -16,6 +16,11 @@ use catplay_csm::{
 /// ~50 bytes/line * 200 = ~10 KB worst case, vs the 768 K partition).
 const BOOT_RX_MAX: u32 = 200;
 
+/// Phase 1: the RouteGuidanceDisplayComponent identifier we declare to the
+/// iPhone (dongle-as-car). The bridge remaps it to the A6's id explicitly
+/// (never by assumption).
+pub const RG_COMPONENT_ID: u16 = 1;
+
 /// A CSM session to connect with iPhone's iAP2 over USB, Bluetooth(Wi-Fi details advertisement only), or AirPlay RTSP transports.
 pub struct CarPlayServerSession {
     mfi: Option<MfiDeficeRef>,
@@ -36,6 +41,12 @@ pub struct CarPlayServerSession {
     // 15 s window (see respond()).
     boot_rx_logged: u32,
     boot_rx_done: bool,
+
+    // Phase 1: route-guidance bridge feed (None = not wired, events dropped).
+    rg_sink: Option<RouteGuidanceSink>,
+    /// Device accepted our identification — the 0x5200 route-guidance
+    /// request is only sent after this (mirrors the A6's bootstrap order).
+    id_accepted: bool,
 
     events_rx: mpsc::UnboundedReceiver<CarPlayServerSessionEventRx>,
     events_tx: mpsc::UnboundedSender<CarPlayServerSessionEventTx>,
@@ -120,6 +131,42 @@ pub enum CarPlayServerSessionEventRx {
     FeedGpsGprmc(GPRMCDataStatusValuesNotification),
     /// Feed GPS NMEA data.
     FeedGpsNmea(LocationInformation),
+}
+
+/// Route-guidance packets received FROM the real iPhone (Phase 1 bridge
+/// input). The dongle-as-car side declares a RouteGuidanceDisplayComponent,
+/// so the iPhone streams these once it starts a route.
+#[derive(Debug, Clone)]
+pub enum RouteGuidanceEvent {
+    /// 0x5201 — live route state (distance to next maneuver, active index).
+    Update(RouteGuidanceUpdate),
+    /// 0x5202 — maneuver metadata (exit_info, road name, geometry).
+    Maneuver(RouteGuidanceManeuverInformation),
+    /// 0x5204 — lane guidance.
+    Lanes(LaneGuidanceInformation),
+    /// The RX session went away (pipe torn down): the bridge must clear
+    /// all route state and stop emitting.
+    Disconnected,
+}
+
+/// Cloneable handle the RX session uses to publish route-guidance events
+/// to the c2a bridge (None = bridge not wired, events dropped).
+#[derive(Clone)]
+pub struct RouteGuidanceSink {
+    tx: mpsc::UnboundedSender<RouteGuidanceEvent>,
+}
+
+impl RouteGuidanceSink {
+    pub fn new(tx: mpsc::UnboundedSender<RouteGuidanceEvent>) -> Self {
+        Self { tx }
+    }
+
+    pub fn push(&self, event: RouteGuidanceEvent) {
+        // Non-blocking and infallible (unbounded channel): the bridge is
+        // the sole consumer; a slow bridge only grows the queue, it can
+        // never stall the CSM callback.
+        let _ = self.tx.unbounded_send(event);
+    }
 }
 
 #[derive(Default, Eq, PartialEq)]
@@ -223,6 +270,7 @@ impl CarPlayServerSession {
     pub fn new(
         mfi: Option<MfiDeficeRef>,
         identity: CarPlaySessionIdentity,
+        rg_sink: Option<RouteGuidanceSink>,
     ) -> (
         Self,
         mpsc::UnboundedSender<CarPlayServerSessionEventRx>,
@@ -247,10 +295,20 @@ impl CarPlayServerSession {
                 gps_sub: false,
                 boot_rx_logged: 0,
                 boot_rx_done: false,
+                rg_sink,
+                id_accepted: false,
             },
             events_tx0,
             events_rx1,
         )
+    }
+
+    /// Pipe teardown: the bridge must clear all route state and stop
+    /// emitting (the iPhone stream is gone with this session).
+    fn drop_session(&mut self) {
+        if let Some(sink) = &self.rg_sink {
+            sink.push(RouteGuidanceEvent::Disconnected);
+        }
     }
 
     pub fn id(identity: &CarPlaySessionIdentity) -> IdentificationInformation {
@@ -292,6 +350,16 @@ impl CarPlayServerSession {
                     StopListUpdates::PACKET_ID,
                 ][..],
             ),
+            /* Phase 1: we (device) request route-guidance updates from the
+               iPhone; the A6 also lists 0x5203 in its sent list, so both
+               directions are declared. */
+            (
+                true,
+                &[
+                    StartRouteGuidanceUpdates::PACKET_ID,
+                    StopRouteGuidanceUpdates::PACKET_ID,
+                ][..],
+            ),
             /* Illegal if GPS is not declared */
             (identity.has_gps, &[LocationInformation::PACKET_ID][..]),
             /* Illegal if live transport is not USB */
@@ -319,6 +387,17 @@ impl CarPlayServerSession {
                     DeviceUUIDUpdate::PACKET_ID,
                     CallStateUpdate::PACKET_ID,
                     ListUpdate::PACKET_ID,
+                ][..],
+            ),
+            /* Phase 1: the iPhone streams these to us (dongle-as-car).
+               0x5203 is the accessory-side "stop" (route ended). */
+            (
+                true,
+                &[
+                    RouteGuidanceUpdate::PACKET_ID,
+                    RouteGuidanceManeuverInformation::PACKET_ID,
+                    StopRouteGuidanceUpdates::PACKET_ID,
+                    LaneGuidanceInformation::PACKET_ID,
                 ][..],
             ),
             /* Illegal if GPS is not declared */
@@ -354,6 +433,21 @@ impl CarPlayServerSession {
             engine_type: vec![EngineTypes::Gasoline],
             ..VehicleInformationComponent::default()
         });
+
+        // Phase 1: route-guidance display component. Generous caps: the
+        // iPhone sends us full street/exit strings (the A6's own caps of
+        // 6/6/20 are enforced by the c2a bridge at forward time, not here).
+        id.route_guidance_display_component = vec![RouteGuidanceDisplayComponent {
+            identifier: RG_COMPONENT_ID,
+            name: "RG_HUD_USE".into(),
+            max_current_road_name_length: Some(32),
+            max_destination_name_length: Some(32),
+            max_after_maneuver_road_name_length: Some(32),
+            max_maneuver_description_length: Some(32),
+            max_guidance_maneuver_storage_capacity: Some(4),
+            max_lane_guidance_description_length: Some(32),
+            max_lane_guidance_storage_capacity: Some(4),
+        }];
 
         if identity.has_gps {
             id.location_information_component = Some(LocationInformationComponent {
@@ -417,6 +511,12 @@ impl CarPlayServerSession {
             },
             channel: identity.wifi_channel,
         })
+    }
+}
+
+impl Drop for CarPlayServerSession {
+    fn drop(&mut self) {
+        self.drop_session();
     }
 }
 
@@ -486,22 +586,39 @@ impl CsmSession for CarPlayServerSession {
                 u.route_guidance_maneuver_total_count,
                 u.source_name,
             );
+            // Phase 1: feed the bridge (live distance + route state).
+            if let Some(sink) = &self.rg_sink {
+                sink.push(RouteGuidanceEvent::Update(u.clone()));
+            }
         }
         if let Some(m) = packet.cast::<RouteGuidanceManeuverInformation>() {
             info!(
-                "RG_RX_5202 @ {:?}: index={} type={:?} after_road={:?} dist_m={:?}",
-                since, m.index, m.maneuver_type, m.after_maneuver_road_name, m.distance_between_maneuver
+                "RG_RX_5202 @ {:?}: index={} type={:?} after_road={:?} dist_m={:?} exit_info={:?}",
+                since, m.index, m.maneuver_type, m.after_maneuver_road_name, m.distance_between_maneuver, m.exit_info
             );
+            // Phase 1: feed the bridge (maneuver metadata incl. exit_info).
+            if let Some(sink) = &self.rg_sink {
+                sink.push(RouteGuidanceEvent::Maneuver(m.clone()));
+            }
         }
         if packet.cast::<StopRouteGuidanceUpdates>().is_some() {
-            info!("RG_RX_5203 @ {:?}: StopRouteGuidanceUpdates", since);
+            info!("RG_RX_5203 @ {:?}: iPhone stopped route guidance updates", since);
+            // Phase 1: route ended upstream — the bridge clears state.
+            if let Some(sink) = &self.rg_sink {
+                sink.push(RouteGuidanceEvent::Disconnected);
+            }
         }
         if let Some(l) = packet.cast::<LaneGuidanceInformation>() {
             info!("RG_RX_5204 @ {:?}: index={} lanes={}", since, l.lane_guidance_index, l.lane_information.len());
+            // Phase 1: feed the bridge (lane guidance, pass-through).
+            if let Some(sink) = &self.rg_sink {
+                sink.push(RouteGuidanceEvent::Lanes(l.clone()));
+            }
         }
 
         if packet.cast::<IdentificationAccepted>().is_some() {
             info!("RG_RX_IDENT_ACCEPTED @ {:?}: device accepted dongle identification", since);
+            self.id_accepted = true;
         }
 
         // if let Some(_) = packet.cast::<IdentificationAccepted>() {
@@ -540,6 +657,23 @@ impl CsmSession for CarPlayServerSession {
 
             if self.identity.wants_now_playing {
                 _handle.send(&StartNowPlayingUpdates::all())?;
+            }
+
+            // Phase 1: ask the iPhone to stream route guidance, declaring
+            // our display component and — critically — supports_exit_info
+            // (without it the iPhone never populates 0x5202.exit_info).
+            // Only after identification was accepted (bootstrap parity
+            // with the A6: id accepted -> auth -> 0x5200).
+            if self.id_accepted {
+                _handle.send(&StartRouteGuidanceUpdates {
+                    route_guidance_display_component_id: vec![RG_COMPONENT_ID],
+                    source_name: CsmFlag::Yes,
+                    source_supports_route_guidance: CsmFlag::Yes,
+                    supports_exit_info: CsmFlag::Yes,
+                    destination_time_zone_offset_minutes: CsmFlag::No,
+                    ev_charge_info: CsmFlag::No,
+                })?;
+                info!("RG_RX_5200_SENT @ {:?}: requested route guidance updates (component {RG_COMPONENT_ID}, exit_info=Yes)", since);
             }
         }
 

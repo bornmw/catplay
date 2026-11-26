@@ -6,6 +6,8 @@ pub mod diag;
 mod homekit_manager;
 mod main_init;
 mod mfi_manager;
+mod nav_bridge;
+mod nav_combo;
 pub mod nav_selftest;
 mod prod_gadget;
 pub mod proxy;
