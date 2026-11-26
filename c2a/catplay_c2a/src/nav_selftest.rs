@@ -51,10 +51,6 @@ const RUN_SECS: u32 = 60;
 /// A6 MIB3 declared RouteGuidanceDisplayComponent id.
 const COMPONENT_ID: u16 = 1;
 const MANEUVER_INDEX: u16 = 0;
-/// DATABASE-PROBE (temporary): a FRESH maneuver index so the MIB3 cannot
-/// be showing a cached "I-87 North" from a prior run. Pair with
-/// `maneuver_highway()`'s non-road string "Exit 30". Revert after probe.
-const DB_PROBE_INDEX: u16 = 7;
 
 /// Spawn the command-file poller. Lives for the process lifetime.
 pub fn spawn(outbox: Arc<NavOutbox>) {
@@ -208,12 +204,7 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
                 }
                 let dest_m = 8000u32.saturating_sub(e * 50);
                 let time_s = 900u64.saturating_sub(e as u64);
-                enqueue(
-                    &outbox,
-                    generation,
-                    &active_update(next_m, dest_m, time_s, false, DB_PROBE_INDEX),
-                    &mut enqueued,
-                )?;
+                enqueue(&outbox, generation, &active_update(next_m, dest_m, time_s, false), &mut enqueued)?;
             }
             2 => {
                 // Urban stage: NO exit_info — the street name must stay.
@@ -227,12 +218,7 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
                 let next_m = 500u32.saturating_sub(e * 5);
                 let dest_m = 8000u32.saturating_sub(e * 5);
                 let time_s = 900u64.saturating_sub(e as u64);
-                enqueue(
-                    &outbox,
-                    generation,
-                    &active_update(next_m, dest_m, time_s, false, MANEUVER_INDEX),
-                    &mut enqueued,
-                )?;
+                enqueue(&outbox, generation, &active_update(next_m, dest_m, time_s, false), &mut enqueued)?;
             }
             3 => {
                 if !stage_c {
@@ -246,12 +232,7 @@ async fn run_selftest(outbox: Arc<NavOutbox>, stop: Arc<AtomicBool>) -> Result<(
                 let next_m = 380u32.saturating_sub(e * 5);
                 let dest_m = 7930u32.saturating_sub(e * 5);
                 let time_s = 886u64.saturating_sub(e as u64);
-                enqueue(
-                    &outbox,
-                    generation,
-                    &active_update(next_m, dest_m, time_s, true, MANEUVER_INDEX),
-                    &mut enqueued,
-                )?;
+                enqueue(&outbox, generation, &active_update(next_m, dest_m, time_s, true), &mut enqueued)?;
             }
             _ => {} // 0–5 s: validate, quiet
         }
@@ -284,7 +265,7 @@ const A6_MAX_AFTER_MANEUVER_ROAD: usize = 20;
 fn validate_caps() -> Result<(), String> {
     // 0x5201 active — both lane modes (Stage C uses lanes=true).
     for lanes in [false, true] {
-        let u = active_update(500, 8000, 900, lanes, MANEUVER_INDEX);
+        let u = active_update(500, 8000, 900, lanes);
         if let Some(s) = &u.current_road_name {
             if s.chars().count() > A6_MAX_CURRENT_ROAD {
                 return Err(format!("current_road_name '{s}' exceeds A6 cap {A6_MAX_CURRENT_ROAD}"));
@@ -326,8 +307,8 @@ fn validate_caps() -> Result<(), String> {
     }
     let highway = maneuver_highway();
     check_maneuver_caps(&highway)?;
-    if highway.index != DB_PROBE_INDEX {
-        return Err(format!("0x5202 index {} != DB_PROBE_INDEX", highway.index));
+    if highway.index != MANEUVER_INDEX {
+        return Err(format!("0x5202 index {} != MANEUVER_INDEX", highway.index));
     }
     // The production combo strings for the exact Stage A timeline values
     // must exist and fit the A6 cap (nav_combo guarantees the fit, but
@@ -363,9 +344,8 @@ fn check_maneuver_caps(m: &RouteGuidanceManeuverInformation) -> Result<(), Strin
 
 // --- packet builders -----------------------------------------------------
 
-/// Active route, 0x5201. Km units (A6 is de-locale). `index` is the
-/// current-maneuver reference (must match the 0x5202 index being sent).
-fn active_update(next_m: u32, dest_m: u32, time_s: u64, lanes: bool, index: u16) -> RouteGuidanceUpdate {
+/// Active route, 0x5201. Km units (A6 is de-locale).
+fn active_update(next_m: u32, dest_m: u32, time_s: u64, lanes: bool) -> RouteGuidanceUpdate {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -386,7 +366,7 @@ fn active_update(next_m: u32, dest_m: u32, time_s: u64, lanes: bool, index: u16)
         distance_remaining_to_next_maneuver: Some(next_m),
         distance_remaining_to_next_maneuver_display_string: Some(next_string(next_m)),
         distance_remaining_to_next_maneuver_display_units: Some(DistanceDisplayUnits::Km),
-        route_guidance_maneuver_current_list: Some(CsmPacked::from(vec![index])),
+        route_guidance_maneuver_current_list: Some(CsmPacked::from(vec![MANEUVER_INDEX])),
         route_guidance_maneuver_total_count: Some(1),
         route_guidance_visible_in_app: Some(true),
         present_lane_guidance: Some(lanes),
@@ -431,15 +411,12 @@ fn maneuver(exit_angle: bool) -> RouteGuidanceManeuverInformation {
 /// combo replaces the street name on the follow-up refreshes.
 ///
 /// DATABASE-PROBE (temporary): after_maneuver_road_name is "Exit 30"
-/// (NOT a road name) on a FRESH index, to test whether the MIB3 only
-/// renders road names from its own map database. If "Exit 30" renders,
-/// the database hypothesis is disproven and the blocker is the
-/// same-index no-repaint; if it does not, the MIB3 filters non-database
-/// strings. Revert to "I-87 North" + MANEUVER_INDEX after the probe.
+/// (NOT a road name) to test whether the MIB3 only renders road names
+/// from its own map database. Revert to "I-87 North" after the probe.
 fn maneuver_highway() -> RouteGuidanceManeuverInformation {
     RouteGuidanceManeuverInformation {
         route_guidance_display_component_id: COMPONENT_ID,
-        index: DB_PROBE_INDEX,
+        index: MANEUVER_INDEX,
         maneuver_type: Some(ManeuverType::LeftTurnAngleIsBetween45And135Degrees),
         after_maneuver_road_name: Some("Exit 30".into()),
         distance_between_maneuver: Some(3200),
